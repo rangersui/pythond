@@ -1,4 +1,4 @@
-# agent-tty — REPL-agnostic cell execution for AI agents
+# agent-tty — persistent REPL for AI agents, shared live terminal for humans
 
 ## Install
 
@@ -10,7 +10,7 @@ Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
 
 ## When to use
 
-When the agent needs persistent REPL state across tool calls: live connections, imported modules, running servers, debug sessions. Use k when the process must stay alive between commands. Use bash_tool for one-shot commands.
+Use k when the process must keep memory between agent turns: live connections, imported modules, cwd/env, running servers, SSH sessions, browser/CDP sockets, or debugger state. The session is a real tmux TTY — the human can watch (`k watch`), interrupt (`k int`), or take over (`tmux attach`) without losing state. Use km for callback-style completion of long cells. Use k poll only as a simple fallback for scripts or agent runtimes without a monitor/interrupt path. Use bash_tool for one-shot commands.
 
 ## First Steps
 
@@ -226,11 +226,36 @@ k new remote "ssh prod"                        # zero config
 
 ## km — event monitor
 
+Callback-style completion for persistent TTY cells. Tails the session log via pipe-pane. Each stdout line is one JSON event.
+
+Designed for **Claude Code's Monitor tool** — each stdout line becomes an agent interrupt. Other frameworks can spawn `km` as a subprocess and read stdout.
+
 ```
 km <session> [cell_id] [-1]
 ```
 
-Watches a session via pipe-pane. Each stdout line is one JSON event. `-1` exits after first completion (one-shot `.then()`).
+`-1` exits after first completion (one-shot `.then()`).
+
+### Persistent state plus monitor
+
+k is the stateful terminal. km is the callback channel for long-running cells. Background task support alone is not enough when the process state matters; km lets the persistent TTY keep running and wakes the agent when the cell finishes. Poll loops waste tokens and add latency — every `k poll` is a tool call that returns "running" and accomplishes nothing.
+
+```bash
+# poll loop: burns a tool call every N seconds
+# k poll → "running" → k poll → "running" → k poll → "done"
+
+# km: one tool call, block until done
+km work -1
+# {"cell_id": "...", "status": "done", "ts": "..."}
+```
+
+Use `km -1` when the task takes longer than a few seconds — fire, start monitor, get interrupted on completion. Use `k poll` for quick checks, shell scripts, or agent frameworks without a monitor/interrupt path.
+
+### Continuous mode
+
+Without `-1`, `km` streams all events indefinitely. For multi-cell orchestration where the agent reacts to each completion.
+
+### Events
 
 ```
 fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}

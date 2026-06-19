@@ -1,10 +1,28 @@
 # agent-tty
 
-Persistent terminal sessions for AI agents. Drives tmux, returns JSON.
+Persistent REPL for AI agents. Shared live terminal for humans.
+
+bash_tool runs a command and forgets. agent-tty keeps a persistent TTY
+inside tmux — variables, cwd, imports, connections, SSH sessions, and
+debugger state survive across agent turns. The human watches the same
+terminal live, can interrupt with `k int`, or take over with `tmux attach`.
 
 The package is `agent-tty`. The CLI command is `k`, intentionally short to minimise token overhead in agent tool calls. `km` is the companion event monitor.
 
 **Requires tmux 3.0+** — k drives tmux for PTY multiplexing; it does not bundle or replace it.
+
+## Why agent-tty
+
+`bash_tool` is curl. `k` is a socket.
+
+Use `k` when the process must keep memory between commands: Python imports,
+database connections, browser/CDP sockets, remote shells, debuggers, running
+servers. `k watch` gives a human the same live filtered view — cell markers,
+completion ticks, frame noise hidden. `tmux attach` is native raw takeover.
+
+Use `km` when a long cell should call the agent back on completion.
+Use `k poll` only as a simple fallback for scripts or agent runtimes without a
+monitor/interrupt path.
 
 ## Quick Start
 
@@ -49,14 +67,16 @@ k fire   [-t N] [session] <code>               async fire (default 300s)
 k poll   [session] [cell_id]                   poll (O(1))
 k run    [-j] [-t N] [session] <code>          sync (default 30s)
 k await  ...                                   alias for run
-k notify [session] <message>                   notification
-k int    [session]                             ctrl-c
+k notify [session] <message>                   notification (direct to log)
+k int    [session]                             ctrl-c (+ re-frame in repeat mode)
 k kill   <session>                             kill + cleanup
 k ls                                           list sessions
 k status [session]                             health check
 k watch  [session]                             live filtered view
 k history [-n N] [session]                     last N×5 lines (default 5)
 ```
+
+Session resolves: explicit arg > K_SESSION env > auto-detect (single session).
 
 ## Frame Detection
 
@@ -122,13 +142,62 @@ cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
 Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `interrupt failed; use k kill`.
 
+## Metadata on Disk
+
+```
+/tmp/k_cells/<session>/
+  _session.json       {name} or {name, prompt}
+  _lock.json          {cell_id, log_offset, echo_count, bg_pid, timed_out?}
+  _output.log         pipe-pane stream (append-only)
+  <cell_id>_result.json  stream processor output (deleted after poll)
+```
+
+## Known Limitations
+
+**Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
+
+**echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
+
+**Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
+
+**Python 3.13+ `_pyrepl`**: The new Python REPL auto-indents pasted code, doubling indentation on multi-line blocks. Workaround: `k new py "env PYTHON_BASIC_REPL=1 python3 -i"`. Single-line code is unaffected.
+
 ## km — event monitor
+
+Callback-style completion for persistent TTY cells. `km` tails the session log via pipe-pane and emits one JSON line per event to stdout. No polling, no sleep loops.
+
+Currently designed for **Claude Code's Monitor tool**, which reads each stdout line as an agent interrupt. Other agent frameworks can achieve the same by spawning `km` as a subprocess and reading its stdout.
 
 ```
 km <session> [cell_id] [-1]
 ```
 
-Watches a session via pipe-pane. Each stdout line is one JSON event. `-1` exits after first completion (one-shot `.then()`).
+`-1` exits after first completion — one-shot `.then()` for agent orchestration.
+
+### Why km after k
+
+`k` is the stateful terminal. `km` is the callback channel for long-running cells.
+Background task support alone is not enough when the process state matters;
+`km` lets the persistent TTY keep running and wakes the agent when the cell
+finishes. `k poll` is O(1) and still useful for simple scripts, but poll loops
+waste tokens and add latency:
+
+```bash
+# poll loop: agent burns a tool call every N seconds
+# k poll → "running" → k poll → "running" → k poll → "done"
+
+# km: one tool call, block until done
+km work -1
+# {"cell_id": "...", "status": "done", "ts": "..."}
+```
+
+With `km -1`, the agent fires a long task, starts `km` as a background monitor, and gets interrupted exactly once when the task completes. Zero wasted calls.
+
+### Continuous mode
+
+Without `-1`, `km` runs indefinitely — every fired/done/notify event streams as a JSON line. Useful for multi-cell orchestration where the agent needs to react to each completion in sequence.
+
+### Events
 
 ```
 fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}
