@@ -5,3 +5,5 @@ dist/
 build/
 *.egg
 .eggs/
+.codex-tmux-outbox.txt
+local/

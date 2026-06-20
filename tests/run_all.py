@@ -19,6 +19,7 @@ def run(cmd: list[str]) -> None:
 
 def main() -> int:
     run([sys.executable, str(ROOT / "tests" / "test_contracts.py")])
+    run([sys.executable, str(ROOT / "tests" / "test_bridge_contracts.py")])
     run([sys.executable, str(ROOT / "tests" / "test_docs.py")])
     run(["bash", str(ROOT / "tests" / "test.sh"), K_ARG])
     run([sys.executable, str(ROOT / "tests" / "test_regressions.py"), K_ARG])

@@ -193,7 +193,7 @@ WSL is fine; native Windows fails fast.
 
 Callback-style completion for persistent TTY cells. `km` tails the session log via pipe-pane and emits one JSON line per event to stdout. No polling, no sleep loops.
 
-Each stdout line is a JSON event. Works with any agent host that has background-notification support: Claude Code's Monitor tool reads each line as an interrupt, Codex Desktop can bridge via its `notify` callback, and plain subprocess readers work the same way.
+Each stdout line is a JSON event. Works with any agent host that has background-notification support: Claude Code's Monitor tool can read each line as an interrupt, Codex App Server can consume it through `vendor/codex_bridge.py`, and plain subprocess readers work the same way.
 
 ```
 km <session> [cell_id] [-1]
@@ -224,6 +224,42 @@ With `km -1`, the agent fires a long task, starts `km` as a background monitor, 
 
 Without `-1`, `km` runs indefinitely — every fired/done/notify event streams as a JSON line. Useful for multi-cell orchestration where the agent needs to react to each completion in sequence.
 
+### Codex bridge (experimental)
+
+`vendor/codex_bridge.py` is a local experiment for hosts that expose Codex App Server.
+It reads `km` stdout, polls completed cells with `k poll`, and starts a visible
+Codex turn with `turn/start` when the target thread is idle. If the thread is
+already active, events are queued and batched into one visible turn after the
+thread becomes idle. That makes the event visible as a normal Codex turn instead
+of hiding it in prompt history.
+
+Important caveat from local testing on 2026-06-20: Codex App Server does not
+expose a single Monitor-like primitive. `thread/inject_items` persists data for
+later turns but does not wake an agent; `turn/steer` needs an active turn and
+expected turn id; `turn/interrupt` stops work but does not carry payload; and
+`turn/start` wakes an idle thread but can create a parallel side turn if another
+turn is still active. The bridge owns that state machine.
+
+Codex Desktop may also fail to live-refresh turns started by another app-server
+client. Treat this bridge as better suited to headless/remote automation and
+external sinks such as tmux, a web UI, or email. It is not a guarantee that the
+Desktop UI will update in real time.
+
+```bash
+# find candidates first
+python vendor/codex_bridge.py --list-threads --thread-cwd . --thread-search "agent tty"
+python vendor/codex_bridge.py --list-loaded
+
+# run the bridge daemon
+python vendor/codex_bridge.py --session work --thread-id THREAD_ID
+```
+
+The bridge is deliberately type-sealed: km lines must parse into `KmEvent`,
+thread ids must become `ThreadHandle`, thread runtime must become
+`ThreadRuntimeStatus`, and visible `turn/start` calls only accept an
+`EventPrompt` derived from a validated event and optional `PollResult`. The
+static check is `python tests/test_bridge_contracts.py`.
+
 ### Events
 
 ```
@@ -240,6 +276,7 @@ error:       {"session": "...", "status": "error",  "message": "...", "ts": "...
 
 ```bash
 python tests/test_contracts.py      # static code contracts, no tmux
+python tests/test_bridge_contracts.py # Codex bridge type-seal contracts, no app-server
 python tests/test_docs.py           # docs/package drift, no tmux
 bash tests/test.sh                  # 66 tests (64 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
@@ -252,6 +289,7 @@ python tests/run_all.py             # all suites
 src/agent_tty/cli.py       k — main script
 src/agent_tty/monitor.py   km — event monitor
 scripts/k, scripts/km      dev shims (no pip install needed)
+vendor/codex_bridge.py     experimental km → Codex App Server bridge
 pyproject.toml             pip install agent-tty → agent-tty, k, km in PATH
 man/agent-tty.1            man page source
 tests/test.sh              runtime smoke suite

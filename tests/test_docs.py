@@ -73,6 +73,7 @@ for doc_name, text in MAINTAINER_DOCS:
     check(f"{doc_name}: runtime check count", f"{expected_checks} tests" in text, f"expected '{expected_checks} tests'")
     for script in (
         "tests/test_contracts.py",
+        "tests/test_bridge_contracts.py",
         "tests/test_docs.py",
         "tests/test.sh",
         "tests/test_regressions.py",
@@ -113,6 +114,8 @@ check("README.md: no stale line counts", not re.search(r"scripts/(?:k|km)\s+\d+\
 check("README.md: no stale test.sh line count", not re.search(r"test\.sh\s+\d+\s+lines", README))
 check("repo: runtime test lives under tests", (ROOT / "tests" / "test.sh").exists())
 check("repo: no root test.sh", not (ROOT / "test.sh").exists())
+check("repo: Codex bridge exists", (ROOT / "vendor" / "codex_bridge.py").exists())
+check("repo: bridge contract test exists", (ROOT / "tests" / "test_bridge_contracts.py").exists())
 check("repo: man page exists", (ROOT / "man" / "agent-tty.1").exists())
 check("docs/index.html: POSIX requirement", "Requires POSIX" in HTML and "native Windows fails fast" in HTML)
 
@@ -161,7 +164,9 @@ for action in ("actions/checkout@v6", "actions/setup-python@v6"):
     check(f"CI: uses {action}", action in CI)
 for needle in (
     "python tests/test_contracts.py",
+    "python tests/test_bridge_contracts.py",
     "python tests/test_docs.py",
+    "python -m py_compile vendor/codex_bridge.py",
     "python -m build",
     "python -m twine check dist/*",
     "python -m agent_tty --version",
@@ -173,6 +178,9 @@ for needle in (
     "tmux",
 ):
     check(f"CI: includes {needle}", needle in CI)
+
+check("README.md: Codex bridge documented", "vendor/codex_bridge.py" in README and "turn/start" in README and "k poll" in README and "queued" in README)
+check("README.md: Codex bridge caveat documented", "Monitor-like" in README and "thread/inject_items" in README and "turn/steer" in README and "Codex Desktop may also fail to live-refresh" in README)
 
 # ── option order: flags before positional args ──
 for doc_name, text in DOCS + (("k help", K_HELP),):
