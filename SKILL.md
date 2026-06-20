@@ -176,11 +176,15 @@ k run -j py "print(factorial(10))"
 # 3628800
 ```
 
-## Quoting Rule
+## Everything Runs in k
 
-Code with quotes, backslashes, f-strings, or nested escaping often breaks when passed through bash_tool → shell → k → tmux → REPL. Do not try to escape your way out.
+Default to k. A k session is the shared working terminal — the human can watch it, attach to it, interrupt it, and see the same cwd/env/history/output the agent sees. Even commands that look stateless (`ls`, `pwd`, `git status`) belong in k because they are part of the shared terminal narrative. Live connections, sockets, database handles, imported modules, SSH sessions — these exist only in the REPL's memory. Splitting work between k and shell tools scatters history and makes the human watch the wrong place.
 
-**Write to file, then load:**
+Shell tools are plumbing, not the work surface. Use them only for: writing quote-safe transport files, starting/stopping helper daemons, checking the host environment before a k session exists, or repairing a broken session.
+
+**Complex code: write to file, then load into k.**
+
+The heredoc (`<< 'EOF'`) preserves file content literally. `source`/`exec` loads it into the live session with zero escaping problems:
 
 ```bash
 # bash: write + source
@@ -199,7 +203,7 @@ EOF
 k run -j py "exec(open('/tmp/task.py').read())"
 ```
 
-**Inline is fine when code has no quoting conflicts:**
+**Simple code: inline directly in k run.**
 
 ```bash
 k run -j work "echo hello && ls -la"
@@ -212,7 +216,7 @@ def factorial(n):
 "
 ```
 
-The rule: if the code has `"` or `'` or `\` or `$` inside string literals, write it to a file.
+The rule: if the code has `"` or `'` or `\` or `$` inside string literals, write it to a file and load through k. Do not try to hand-escape complex code inline — the quoting layers (shell → k → tmux → REPL) will fight you.
 
 ## Language Notes
 
