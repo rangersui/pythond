@@ -1,11 +1,12 @@
 # agent-tty
 
-Persistent REPL for AI agents. Shared live terminal for humans.
+A persistent TTY for your AI agent. Shared live terminal for humans.
 
-bash_tool runs a command and forgets. agent-tty keeps a persistent TTY
-inside tmux — variables, cwd, imports, connections, SSH sessions, and
-debugger state survive across agent turns. The human watches the same
-terminal live, can interrupt with `k int`, or take over with `tmux attach`.
+bash_tool runs a command and forgets. agent-tty gives your agent a
+persistent TTY inside tmux — variables, cwd, imports, connections, SSH
+sessions, and debugger state survive across agent turns. You watch the
+same terminal live, interrupt with `k int`, or take over with
+`tmux attach`.
 
 The package is `agent-tty`. The CLI command is `k`, intentionally short to minimise token overhead in agent tool calls. `km` is the companion event monitor.
 
@@ -15,14 +16,13 @@ The package is `agent-tty`. The CLI command is `k`, intentionally short to minim
 
 `bash_tool` is curl. `k` is a socket.
 
-Use `k` when the process must keep memory between commands: Python imports,
+Give your agent `k` when it needs memory between turns: Python imports,
 database connections, browser/CDP sockets, remote shells, debuggers, running
-servers. `k watch` gives a human the same live filtered view — cell markers,
-completion ticks, frame noise hidden. `tmux attach` is native raw takeover.
+servers. You see everything through `k watch` — cell markers, completion
+ticks, frame noise hidden — or `tmux attach` for native raw takeover.
 
-Use `km` when a long cell should call the agent back on completion.
-Use `k poll` only as a simple fallback for scripts or agent runtimes without a
-monitor/interrupt path.
+`km` calls your agent back when a long cell finishes.
+`k poll` is a simple fallback for runtimes without monitor/interrupt support.
 
 ## Quick Start
 
@@ -35,6 +35,32 @@ k new py python3 -i                         # Python 3.12 and below
 k new py "env PYTHON_BASIC_REPL=1 python3 -i"  # Python 3.13+ (disables _pyrepl auto-indent)
 k run -j py "print(42)"
 ```
+
+## Recommended Workflow
+
+The agent defaults to `k` — it is the shared working terminal, and you
+watch the same cwd/env/history/output the agent sees. For code with quotes,
+f-strings, SQL, shell variables, or any escaping complexity, the agent
+writes a file with its shell tool, then loads it through `k`.
+
+```bash
+cat > /tmp/task.py << 'EOF'
+import os
+
+conn = db.connect(os.environ["DATABASE_URL"])
+rows = conn.execute("SELECT * FROM orders WHERE status = 'pending'").fetchall()
+print(f"found {len(rows)} pending orders")
+EOF
+k run -j py "exec(open('/tmp/task.py').read())"
+```
+
+The heredoc preserves content literally. `source`/`exec` loads it into the live
+session, so imports, variables, cwd, sockets, and database handles still
+persist. This avoids shell-quoting fights and the multiline-send edge cases
+that can confuse frame detection: the command sent to `k` is always one
+simple line.
+
+Simple commands still go straight through `k`: `k run -j work "echo hello"`.
 
 ## Install
 
@@ -183,17 +209,26 @@ WSL is fine; native Windows fails fast.
 
 **Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
 
+The `source`/`exec` workflow avoids shell-quoting problems and the multiline-send
+edge cases that can confuse frame detection: the command sent to `k` is always a
+single simple line, while the real code loads inside the live session.
+Repeat-mode frame collision from command *output* (5+ identical non-empty lines)
+is a separate limitation that still applies regardless of how code is sent.
+
 **echo_count heuristic**: generic REPL mode assumes 1 sent line = 1 echoed line. Bash multiline cells avoid this by sourcing a private per-cell script; other REPLs still rely on prompt filtering or hook/exact prompt mode.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
 **Python 3.13+ `_pyrepl`**: The new Python REPL auto-indents pasted code, doubling indentation on multi-line blocks. Workaround: `k new py "env PYTHON_BASIC_REPL=1 python3 -i"`. Single-line code is unaffected.
 
-## km — event monitor
+## km — callback monitor
 
-Callback-style completion for persistent TTY cells. `km` tails the session log via pipe-pane and emits one JSON line per event to stdout. No polling, no sleep loops.
+`km` wakes your agent when a long cell finishes. It tails the session log and
+emits one JSON event per line to stdout — no polling, no sleep loops.
 
-Each stdout line is a JSON event. Works with any agent host that has background-notification support: Claude Code's Monitor tool can read each line as an interrupt, Codex App Server can consume it through `vendor/codex_bridge.py`, and plain subprocess readers work the same way.
+Works with any agent host that has background-notification support: Claude
+Code's Monitor tool, Codex App Server via `vendor/codex_bridge.py`, or a
+plain subprocess reader.
 
 ```
 km <session> [cell_id] [-1]
@@ -203,11 +238,11 @@ km <session> [cell_id] [-1]
 
 ### Why km after k
 
-`k` is the stateful terminal. `km` is the callback channel for long-running cells.
-Background task support alone is not enough when the process state matters;
-`km` lets the persistent TTY keep running and wakes the agent when the cell
-finishes. `k poll` is O(1) and still useful for simple scripts, but poll loops
-waste tokens and add latency:
+`k` is the agent's stateful terminal. `km` is the callback channel for
+long-running cells. Background task support alone is not enough when process
+state matters; `km` lets the persistent TTY keep running and wakes the agent
+when a cell finishes. `k poll` works for simple scripts, but poll loops waste
+tokens and add latency:
 
 ```bash
 # poll loop: agent burns a tool call every N seconds
@@ -218,11 +253,14 @@ km work -1
 # {"cell_id": "...", "session": "work", "status": "done", "ts": "..."}
 ```
 
-With `km -1`, the agent fires a long task, starts `km` as a background monitor, and gets interrupted exactly once when the task completes. Zero wasted calls.
+With `km -1`, the agent fires a long task, starts the monitor in the
+background, and gets woken exactly once on completion. Zero wasted calls.
 
 ### Continuous mode
 
-Without `-1`, `km` runs indefinitely — every fired/done/notify event streams as a JSON line. Useful for multi-cell orchestration where the agent needs to react to each completion in sequence.
+Without `-1`, `km` runs indefinitely — every event streams as a JSON line.
+Useful for multi-cell orchestration where your agent reacts to each
+completion in sequence.
 
 ### Codex bridge (experimental)
 

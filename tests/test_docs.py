@@ -113,6 +113,16 @@ for internal in (
         check(f"{doc_name}: no internal detail {internal}", internal not in text)
 check("README.md: docs/package drift wording", "docs/package drift" in README)
 check("README.md: no stale docs drift scope", "README/SKILL/man/HTML drift" not in README)
+check("README.md: source/exec recommended workflow",
+      "## Recommended Workflow" in README and "source`/`exec` loads it into the live" in README)
+check("README.md: source/exec limitation recovery",
+      "avoids shell-quoting problems and the multiline-send" in README)
+check("EXAMPLES.md: source/exec removes send-side problems",
+      "shell-quoting fights" in EXAMPLES and "multiline-send edge cases" in EXAMPLES)
+check("docs/index.html: zero escaping feature",
+      "Zero escaping" in HTML and "No quoting layers to fight" in HTML)
+check("docs/index.html: source demo first viewport",
+      "cat &gt; /tmp/task.sh" in HTML and 'k run -j work "source /tmp/task.sh"' in HTML)
 
 check("README.md: no stale line counts", not re.search(r"scripts/(?:k|km)\s+\d+\s+lines", README))
 check("README.md: no stale test.sh line count", not re.search(r"test\.sh\s+\d+\s+lines", README))

@@ -1,6 +1,6 @@
 .TH AGENT-TTY 1 "June 2026" "agent-tty 0.1.1" "User Commands"
 .SH NAME
-agent-tty \- persistent REPL sessions for AI agents and shared live terminal for humans
+agent-tty \- persistent TTY for AI agents, shared live terminal for humans
 .SH SYNOPSIS
 .B k new
 .I session
@@ -56,14 +56,13 @@ agent-tty \- persistent REPL sessions for AI agents and shared live terminal for
 .RI [ -1 ]
 .SH DESCRIPTION
 .B agent-tty
-keeps a real tmux TTY alive across agent turns. Variables, imports, cwd,
-environment, sockets, debugger state, servers, and REPL memory persist between
-cells.
+gives your AI agent a real tmux TTY that persists across turns. Variables,
+imports, cwd, environment, sockets, debugger state, servers, and REPL memory
+survive between cells. You watch the same terminal live.
 .PP
 .B k
-is the short agent-facing command. It sends code to the persistent TTY,
-records a cell id, and returns JSON for agents. The installed package also
-provides the
+is the short agent-facing command. The agent sends code to the persistent TTY,
+records a cell id, and gets JSON back. The installed package also provides the
 .B agent-tty
 entry point.
 .PP
@@ -76,13 +75,13 @@ as a one-shot callback-style wait for long-running cells. Use
 as a simple fallback for scripts or agent runtimes without monitor/interrupt
 support.
 .PP
-The human can watch the same live TTY with
+You watch the same live TTY with
 .B k watch
-or attach directly with
+or take over with
 .B tmux attach .
 .B k watch
 is the filtered view with cell markers and completion ticks; tmux attach is
-the native terminal.
+the native raw terminal.
 .SH REQUIREMENTS
 Requires POSIX, Python 3.10+, tmux 3.0+, tail, and POSIX signals. Native
 Windows fails fast. Use WSL, Linux, or macOS.

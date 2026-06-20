@@ -23,6 +23,12 @@ The launcher is stateless. The target is stateful. This is exactly how curl talk
 
 A REPL is blank memory. `source` (bash) and `exec` (python) inject a snapshot into it. After loading, every cell runs inside that context.
 
+This is also the production path for complex code. Write literal content with a
+quoted heredoc, then load it through `k`: the file is only transport, while
+`source`/`exec` runs in the live session. You avoid shell-quoting fights and
+the multiline-send edge cases that can confuse frame detection because the
+command sent to `k` is one simple line.
+
 ### Bash: source
 
 ```bash
@@ -599,15 +605,23 @@ Use k when you need:
 - **Live server**: hot-patchable web server, adaptive systems
 - **Cross-session**: bash + python + remote working together
 
-### When bash_tool is enough
+### When to use the shell tool
 
-- One-off commands: `ls`, `cat`, `grep`
-- File creation and editing
-- Package installation
-- Anything truly stateless
+The agent's shell tool is transport, not the work surface. Use it to:
+- Write files the agent will load into k (`cat > /tmp/task.py << 'EOF'`)
+- Install packages before a k session exists (`pip install ...`)
+- Check the host environment before creating a session
+- Repair a broken session when k itself is stuck
 
 ### The mental model
 
-REPL is not "a better terminal." REPL is a **live process with memory**. Every cell is a conversation turn with that process. The process accumulates knowledge: imports, variables, connections, functions, state. It's the difference between sending letters (one-shot) and having a phone call (persistent session). The call stays connected. Context builds up. You don't re-introduce yourself every sentence.
+The REPL is not "a better terminal." It is a **live process with memory** that
+the agent converses with. Every cell is one turn. The process accumulates
+knowledge: imports, variables, connections, functions, state. It's the
+difference between sending letters (one-shot) and having a phone call
+(persistent session). The call stays connected. Context builds up. The agent
+doesn't re-introduce itself every sentence.
 
 k is the phone line. The REPL is the other person. They remember everything.
+The agent's shell tool writes the letter (the file). k delivers it to the REPL.
+The human watches the call.

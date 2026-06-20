@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-tty / k -- persistent REPL for AI agents, shared live terminal for humans
+agent-tty / k -- persistent TTY for AI agents, shared live terminal for humans
 
 Usage:
   k new    <session> [cmd...] [--prompt="x"]  spawn session (default: bash)

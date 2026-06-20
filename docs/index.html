@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-tty &mdash; persistent REPL for AI agents, shared live terminal for humans</title>
-<meta name="description" content="Persistent REPL state across agent turns. Shared live TTY humans can watch, interrupt, and take over. tmux-backed, JSON cell API, callback completion via km. pip install agent-tty.">
+<title>agent-tty &mdash; a persistent TTY for AI agents, shared live terminal for humans</title>
+<meta name="description" content="Give your AI agent a persistent TTY it can work inside. You watch the same live terminal, interrupt, or take over. tmux-backed, JSON cell API, callback completion via km. pip install agent-tty.">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -123,7 +123,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
 <!-- hero -->
 <section class="hero">
   <h1><span class="accent">agent-tty</span></h1>
-  <p class="tagline">Persistent REPL for AI agents. Shared live terminal for humans.<br>bash_tool is curl. k is a socket.</p>
+  <p class="tagline">A persistent TTY for your AI agent.<br>Shared live terminal for humans.<br>bash_tool is curl. k is a socket.</p>
 
   <div class="install">
     <code id="install-cmd">pip install agent-tty</code>
@@ -142,19 +142,26 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
     <span class="terminal-title">bash</span>
   </div>
   <div class="terminal-body">
-<span class="comment"># start a persistent bash session</span>
+<span class="comment"># agent creates a persistent session</span>
 <span class="prompt">$ </span><span class="cmd">k new work bash</span>
 <span class="output">OK work</span>
 
-<span class="comment"># run code, get JSON</span>
+<span class="comment"># agent runs code, gets JSON</span>
 <span class="prompt">$ </span><span class="cmd">k run -j work "echo hello"</span>
 <span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"hello"</span>}</span>
 
-<span class="comment"># state survives across cells</span>
-<span class="prompt">$ </span><span class="cmd">k run -j work "cd /tmp && export MODE=warm"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"d4e5f6a7b8c9"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">""</span>}</span>
+<span class="comment"># agent writes complex code to a file, loads it through k</span>
+<span class="prompt">$ </span><span class="cmd">cat &gt; /tmp/task.sh &lt;&lt; 'EOF'
+cd /tmp
+export MODE=warm
+printf 'mode=%s pwd=%s\n' "$MODE" "$PWD"
+EOF</span>
 
-<span class="prompt">$ </span><span class="cmd">k run -j work "pwd; echo $MODE"</span>
+<span class="prompt">$ </span><span class="cmd">k run -j work "source /tmp/task.sh"</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"d4e5f6a7b8c9"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"mode=warm pwd=/tmp"</span>}</span>
+
+<span class="comment"># cwd/env persisted because source ran in the live session</span>
+<span class="prompt">$ </span><span class="cmd">k run -j work 'pwd; echo $MODE'</span>
 <span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"e7f8a9b0c1d2"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"/tmp\nwarm"</span>}</span>
   </div>
 </div>
@@ -162,7 +169,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
 <!-- shared live tty -->
 <section class="shared-tty">
   <h2>Shared live TTY</h2>
-  <p class="lead">The agent is not hidden inside a background task. It works in a real tmux session that a human can watch, interrupt, or take over without losing process state.</p>
+  <p class="lead">The agent works in a real tmux session &mdash; not hidden inside a background task. You watch it live, interrupt with <code>k int</code>, or take over with <code>tmux attach</code>.</p>
   <div class="dual-terminals">
     <div class="terminal compact">
       <div class="terminal-bar">
@@ -172,7 +179,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
         <span class="terminal-title">agent view</span>
       </div>
       <div class="terminal-body">
-<span class="comment"># agent sends a multi-command bash cell</span>
+<span class="comment"># agent fires a long cell via its shell tool</span>
 <span class="prompt">$ </span><span class="cmd">k fire work "cd app && pytest -q && tail -20 logs/server.log && export FIX_READY=1"</span>
 <span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
 
@@ -188,7 +195,7 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
         <span class="terminal-title">human view</span>
       </div>
       <div class="terminal-body">
-<span class="comment"># k watch = filtered live view: cell markers, ✓ on done, frame noise hidden</span>
+<span class="comment"># you watch: filtered live view of what the agent is doing</span>
 <span class="prompt">$ </span><span class="cmd">k watch work</span>
 <span class="output">watching work (ctrl-c to stop)
 
@@ -202,7 +209,7 @@ missing DATABASE_URL
 $ export FIX_READY=1
 ── ✓ ──</span>
 
-<span class="comment"># k int interrupts from outside; tmux attach is native raw takeover</span>
+<span class="comment"># you interrupt the agent; tmux attach for native raw takeover</span>
 <span class="prompt">$ </span><span class="cmd">k int work</span>
 <span class="output">OK</span>
 <span class="prompt">$ </span><span class="cmd">tmux attach -t work</span>
@@ -213,17 +220,22 @@ $ export FIX_READY=1
 
 <!-- features -->
 <section class="features">
-  <h2>Why agent-tty</h2>
+  <h2>Why give your agent a TTY</h2>
   <div class="feature-grid">
     <div class="feature">
       <div class="icon">&#x1F441;&#xFE0F;</div>
-      <h3>Human-visible TTY</h3>
-      <p><code>k watch</code> shows a filtered live log (cell markers, completion ticks, frame noise hidden). <code>tmux attach</code> for raw TTY takeover.</p>
+      <h3>You can watch</h3>
+      <p>You see everything the agent does. <code>k watch</code> for filtered live view, <code>tmux attach</code> for raw TTY takeover.</p>
     </div>
     <div class="feature">
       <div class="icon">&#x1F9E0;</div>
-      <h3>State survives</h3>
+      <h3>Agent state survives</h3>
       <p>Variables, cwd, imports, live connections, SSH sessions, and debugger state stay alive across agent turns.</p>
+    </div>
+    <div class="feature">
+      <div class="icon">&#x1F9F5;</div>
+      <h3>Zero escaping</h3>
+      <p>Write code to a file, load with <code>source</code>/<code>exec</code>. The heredoc is literal, the REPL command is one line, and live session state persists. No quoting layers to fight.</p>
     </div>
     <div class="feature">
       <div class="icon">&#x1F514;</div>
@@ -243,16 +255,16 @@ $ export FIX_READY=1
     <div class="feature">
       <div class="icon">&#x1F6E1;&#xFE0F;</div>
       <h3>Safe recovery</h3>
-      <p>One cell at a time, timeout recovery hints, <code>k status</code> next actions, and <code>k int</code> Ctrl-C keep sessions recoverable.</p>
+      <p>One cell at a time. Timeout recovery hints, <code>k status</code> next actions, and <code>k int</code> Ctrl-C &mdash; you or the agent can always recover.</p>
     </div>
   </div>
 </section>
 
 <!-- how it works -->
 <section class="how">
-  <h2>Operator loop</h2>
+  <h2>Agent workflow</h2>
   <div class="flow"><span class="highlight">k new</span> work bash
-  +-- create one persistent TTY
+  +-- agent creates one persistent TTY
   +-- cwd, env, imports, sockets, ssh, debuggers stay alive
 
 <span class="highlight">k run -j</span> work "echo hello"
@@ -265,22 +277,22 @@ $ export FIX_READY=1
 
 <span class="highlight">km work &lt;cell_id&gt; -1</span>
   +-- wait once
-  +-- wake the agent when the cell finishes
+  +-- wake the agent on completion
 
 <span class="highlight">k status</span> work
   +-- repair the log pipe if needed
   +-- print the next useful command
 
-<span class="highlight">k watch</span> work        filtered human view
-<span class="highlight">tmux attach -t work</span> raw human takeover
-<span class="highlight">k int</span> work          interrupt without losing the session</div>
+<span class="highlight">k watch</span> work        you watch, filtered live view
+<span class="highlight">tmux attach -t work</span> you take over, raw terminal
+<span class="highlight">k int</span> work          you interrupt the agent</div>
 </section>
 
 <!-- km monitor -->
 <section class="km-monitor">
   <h2>km &mdash; callback monitor</h2>
   <p style="color:var(--dim);text-align:center;margin-bottom:24px;font-size:0.95rem">
-    Persistent TTY state first; callback completion second.<br>
+    Wakes your agent when a long cell finishes. No polling, no sleep loops.<br>
     Each stdout line is a JSON event. Any host with background-notification support can consume them directly.
   </p>
   <div class="terminal">
@@ -291,10 +303,10 @@ $ export FIX_READY=1
       <span class="terminal-title">agent orchestration</span>
     </div>
     <div class="terminal-body">
-<span class="comment"># poll is a fallback when the runtime cannot monitor stdout</span>
+<span class="comment"># poll is a fallback when the agent runtime cannot monitor stdout</span>
 <span class="prompt">$ </span><span class="cmd">k poll work</span>  <span class="comment"># &rarr; "running"... call again... "running"... again...</span>
 
-<span class="comment"># with km: fire a long stateful cell, then wait for its completion event</span>
+<span class="comment"># with km: agent fires a long cell, gets woken on completion</span>
 <span class="prompt">$ </span><span class="cmd">k fire work "make build"</span>
 <span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
 
