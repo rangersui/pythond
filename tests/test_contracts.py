@@ -7,8 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 K_PATH = ROOT / "src" / "agent_tty" / "cli.py"
 KM_PATH = ROOT / "src" / "agent_tty" / "monitor.py"
+SHARED_PATH = ROOT / "src" / "agent_tty" / "_shared.py"
 K_SRC = K_PATH.read_text(encoding="utf-8")
 KM_SRC = KM_PATH.read_text(encoding="utf-8")
+SHARED_SRC = SHARED_PATH.read_text(encoding="utf-8")
 FAILURES: list[str] = []
 
 
@@ -27,6 +29,7 @@ def parse(path: Path, src: str) -> ast.Module:
 
 K_TREE = parse(K_PATH, K_SRC)
 KM_TREE = parse(KM_PATH, KM_SRC)
+SHARED_TREE = parse(SHARED_PATH, SHARED_SRC)
 
 
 def function(tree: ast.Module, name: str) -> ast.FunctionDef | None:
@@ -65,6 +68,11 @@ cmd_int = function(K_TREE, "cmd_int")
 stream_process = function(K_TREE, "_stream_process")
 cmd_new = function(K_TREE, "cmd_new")
 main = function(K_TREE, "main")
+cmd_watch = function(K_TREE, "cmd_watch")
+cmd_status = function(K_TREE, "cmd_status")
+cmd_notify = function(K_TREE, "cmd_notify")
+cmd_ls = function(K_TREE, "cmd_ls")
+resolve_fn = function(K_TREE, "_resolve")
 
 # ── CellLock RAII structure ──
 cell_lock_cls = None
@@ -115,9 +123,11 @@ check("cmd_fire: calls mark_keep", "mark_keep()" in segment(K_SRC, cmd_fire))
 check("cmd_run: calls mark_keep", "mark_keep()" in segment(K_SRC, cmd_run))
 
 poll_seg = segment(K_SRC, cmd_poll)
-check("poll: timeout marks lock", "_update_lock(" in poll_seg and "timed_out" in poll_seg)
-check("poll: timeout checks update success", "if not _update_lock(" in poll_seg)
+check("poll: validates explicit cell_id", "validate_cell_id(" in poll_seg and "invalid cell_id" in poll_seg)
+check("poll: timeout marks lock", "_mark_terminal(" in poll_seg and "TIMEOUT" in poll_seg)
+check("poll: timeout checks update success", "if not _mark_terminal(" in poll_seg)
 check("poll: timed_out blocks orphan release", 'meta.get("timed_out")' in poll_seg and "use k int or k kill" in poll_seg)
+check("poll: completed done-lock can be released", 'meta.get("completed")' in poll_seg and 'terminal_status") == DONE' in poll_seg)
 check("poll: wrong explicit cell is unknown", 'meta.get("cell_id") != cell_id' in poll_seg and '"unknown cell"' in poll_seg)
 check("poll: no bare except on result read", "except: pass" not in poll_seg)
 check("poll: no release on decode error", "corrupt" not in poll_seg,
@@ -128,7 +138,12 @@ check("int: uses _send_interrupt", "_send_interrupt(" in int_seg)
 check("int: bails on failed interrupt", "interrupt failed" in int_seg)
 check("int: writes error/interrupted", '"status": "error"' in int_seg and '"output": "interrupted"' in int_seg)
 check("int: overwrites stale timeout result", "not os.path.exists(rpath)" not in int_seg)
-check("int: kills watcher before release", int_seg.find("_kill_watcher") < int_seg.find("_release"))
+check("int: kills watcher before active release", "_watcher_pgid(meta) and not _kill_watcher(meta)" in int_seg)
+
+release_fn = function(K_TREE, "_release_unlocked")
+release_seg = segment(K_SRC, release_fn)
+check("_release: no silent broad pass", "except Exception: pass" not in release_seg)
+check("_release: returns failure on unexpected error", "except Exception:" in release_seg and "return False" in release_seg)
 
 new_seg = segment(K_SRC, cmd_new)
 stream_seg = segment(K_SRC, stream_process)
@@ -137,10 +152,11 @@ check("hook: checks executable", "os.access(prompt, os.X_OK)" in new_seg)
 check("hook: runtime uses absolute file path", "os.path.isabs(prompt)" in stream_seg and '"/" in prompt' not in stream_seg)
 
 main_seg = segment(K_SRC, main)
-check("session: _bg validates session", 'verb == "_bg"' in main_seg and "_validate_name(session)" in main_seg)
-check("session: notify direct path validates session", 'verb == "notify"' in main_seg and "_validate_name(rest[0])" in main_seg)
-check("session: k safe name exists", "_SAFE_NAME" in K_SRC and "def _validate_name" in K_SRC)
-check("session: km safe name exists", "_SAFE_NAME" in KM_SRC and "def _validate_name" in KM_SRC and "_validate_name(session)" in KM_SRC)
+check("session: _bg validates session", 'verb == "_bg"' in main_seg and "validate_name(session)" in main_seg)
+check("session: notify direct path validates session", 'verb == "notify"' in main_seg and "validate_name(rest[0])" in main_seg)
+check("shared: _SAFE_NAME defined", "_SAFE_NAME" in SHARED_SRC and "def validate_name" in SHARED_SRC)
+check("k: imports validate_name", "validate_name" in K_SRC and "validate_name(" in K_SRC)
+check("km: imports validate_name", "validate_name" in KM_SRC and "validate_name(" in KM_SRC)
 
 check("pipe-pane: k replace mode", '"-o"' not in K_SRC)
 check("pipe-pane: km replace mode", '"-o"' not in KM_SRC)
@@ -150,10 +166,12 @@ cmd_kill = function(K_TREE, "cmd_kill")
 kill_seg = segment(K_SRC, cmd_kill)
 check("kill: terminates bg watcher", "_kill_watcher(" in kill_seg)
 
-# _kill_watcher helper must use SIGTERM
+# _kill_watcher helper must terminate the watcher process group
 kw_fn = function(K_TREE, "_kill_watcher")
 kw_seg = segment(K_SRC, kw_fn)
 check("_kill_watcher: sends SIGTERM", "signal.SIGTERM" in kw_seg)
+check("_kill_watcher: uses process group", "os.killpg(" in kw_seg)
+check("_kill_watcher: escalates SIGKILL", "signal.SIGKILL" in kw_seg)
 
 # _send_frame_enters helper must use FRAME_ENTERS
 sfe_fn = function(K_TREE, "_send_frame_enters")
@@ -170,9 +188,23 @@ check("_write_result: uses fsync", "os.fsync(" in wr_seg)
 ul_fn = function(K_TREE, "_update_lock")
 check("_update_lock: exists", ul_fn is not None)
 
-# cmd_fire must store bg_pid in lock for orphan detection
+# cmd_fire must store bg_pgid in lock for orphan detection
 fire_seg = segment(K_SRC, cmd_fire)
-check("fire: stores bg_pid in lock", "_update_lock(" in fire_seg and "bg_pid" in fire_seg)
+check("fire: stores bg_pgid in lock", "_update_lock(" in fire_seg and "bg_pgid" in fire_seg)
+
+mark_terminal = function(K_TREE, "_mark_terminal")
+mt_seg = segment(K_SRC, mark_terminal)
+check("_mark_terminal: records completed done", "completed=True" in mt_seg and "terminal_status=DONE" in mt_seg)
+check("_mark_terminal: records timeout", "timed_out=True" in mt_seg and "terminal_status=TIMEOUT" in mt_seg)
+check("_stream_process: marks terminal lock", "_mark_terminal(" in stream_seg)
+
+check("shared: POSIX-only fail-fast", 'os.name != "posix"' in SHARED_SRC and "requires POSIX" in SHARED_SRC)
+check("shared: validate_cell_id exists", "def validate_cell_id" in SHARED_SRC and "CELL_ID_RE" in SHARED_SRC)
+cell_event_fn = function(SHARED_TREE, "cell_event")
+cell_event_seg = segment(SHARED_SRC, cell_event_fn)
+check("shared: cell_event validates cell_id", "validate_cell_id(cell_id)" in cell_event_seg)
+check("shared: cell_event rejects bad status", "raise ValueError" in cell_event_seg)
+check("shared: CELL_END_RE generated from TERMINAL", '"|".join(sorted(TERMINAL))' in SHARED_SRC)
 
 # ── dedup invariants: helpers used, not inlined ──
 # only _send_frame_enters and _send_code should reference FRAME_ENTERS directly
@@ -194,24 +226,38 @@ for fn_name, fn in (("cmd_int", cmd_int), ("cmd_kill", cmd_kill)):
     check(f"{fn_name}: no inline os.kill for watcher", "signal.SIGTERM" not in seg,
           "should use _kill_watcher()")
 
-# ANSI_RE must be consistent between k and km (compare compiled patterns)
-def _extract_ansi_re(tree: ast.Module, src: str) -> str:
-    """Find ANSI_RE assignment via AST, exec it, return .pattern."""
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "ANSI_RE":
-                    lines = src.splitlines()
-                    chunk = "\n".join(lines[node.lineno - 1 : node.end_lineno])
-                    ns = {"re": __import__("re")}
-                    exec(chunk, ns)
-                    return ns["ANSI_RE"].pattern
-    return ""
+# ANSI_RE lives in _shared.py — k and km import it (no local override)
+check("shared: ANSI_RE defined", "ANSI_RE = re.compile(" in SHARED_SRC)
+check("k: no local ANSI_RE", "ANSI_RE = re.compile(" not in K_SRC,
+      "should import ANSI_RE from _shared")
+check("km: no local ANSI_RE", "ANSI_RE = re.compile(" not in KM_SRC,
+      "should import ANSI_RE from _shared")
 
-k_pat = _extract_ansi_re(K_TREE, K_SRC)
-km_pat = _extract_ansi_re(KM_TREE, KM_SRC)
-check("ansi_re: k and km consistent", k_pat == km_pat and k_pat != "",
-      f"k={k_pat[:60]}... km={km_pat[:60]}...")
+for status_name in ("FIRED", "DONE", "TIMEOUT", "INTERRUPTED", "RUNNING", "ERROR", "NOTIFY", "CLOSED"):
+    check(f"k: no local {status_name}", f"\n{status_name} =" not in "\n" + K_SRC)
+    check(f"km: no local {status_name}", f"\n{status_name} =" not in "\n" + KM_SRC)
+
+# event wire format type seal: cell_event + regexes in _shared
+check("shared: cell_event constructor", "def cell_event(" in SHARED_SRC)
+check("shared: CELL_END_RE derived from TERMINAL", "TERMINAL" in SHARED_SRC and "CELL_END_RE" in SHARED_SRC)
+check("shared: CELL_DIR defined", "CELL_DIR" in SHARED_SRC)
+check("k: _result validates cell_id", "def _result" in K_SRC and "validate_cell_id(cid)" in K_SRC)
+check("k: uses lock guard", "class LockGuard" in K_SRC and "fcntl.flock" in K_SRC)
+check("k: private file opens use O_NOFOLLOW", "def _open_private" in K_SRC and "O_NOFOLLOW" in K_SRC)
+check("k: bash multiline source wrapper", "def _should_source_bash" in K_SRC and "def _source_command" in K_SRC)
+check("k: input scripts are private", "def _write_input_script" in K_SRC and "0o600" in segment(K_SRC, function(K_TREE, "_open_private")))
+check("k: input scripts are cleaned", "_cleanup_input_script(session, cell_id)" in K_SRC)
+check("km: notify uses NOTIFY constant", "status\": NOTIFY" in KM_SRC)
+check("km: signal handler does not cleanup inline", "def request_stop" in KM_SRC and "raise KeyboardInterrupt" in KM_SRC)
+check("km: private log open", "def open_private" in KM_SRC and "ensure_private_dir" in KM_SRC)
+check("k: no local cell event format", '── cell:' not in K_SRC or 'cell_event(' in K_SRC,
+      "should use cell_event() from _shared")
+check("km: no local cell event regex", "re.compile.*cell:" not in KM_SRC,
+      "should import CELL_START_RE/CELL_END_RE from _shared")
+
+for fn_name, fn in (("_resolve", resolve_fn), ("cmd_watch", cmd_watch), ("cmd_status", cmd_status),
+                    ("cmd_notify", cmd_notify), ("cmd_ls", cmd_ls)):
+    check(f"{fn_name}: covered by contract", fn is not None)
 
 if FAILURES:
     print("contract failures:")

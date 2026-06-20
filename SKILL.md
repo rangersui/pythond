@@ -6,7 +6,7 @@
 pip install agent-tty            # → k, km, agent-tty in PATH
 ```
 
-Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
+Requires POSIX, Python 3.8+, and tmux 3.0+. Or without pip: `./scripts/k` works immediately (dev shim, no install needed).
 
 ## When to use
 
@@ -67,7 +67,7 @@ k run   -> acquire lock -> send code + run stream processor inline -> release
 
 **Stream processor**: state machine (ECHOING -> OUTPUT -> DONE). Tails the log in real-time. Classifies each line as it arrives. Writes result file when done.
 
-**Background watcher**: fire spawns a Python subprocess per cell. It runs the stream processor and writes the result. poll reads the result file. O(1).
+**Background watcher**: fire spawns a Python subprocess per cell in its own process group. It runs the stream processor, writes the result, and marks a done-lock as `completed`. poll reads the result file. O(1).
 
 ## Frame Detection
 
@@ -88,13 +88,15 @@ log shows:
 
 Works after cd, venv activation, prompt theme change.
 
+Bash multiline cells are special-cased: k writes the original code to a 0600 per-cell script and sends `source <script>` to the persistent shell. That keeps cd/env/functions in the same TTY while avoiding interleaved prompt echoes.
+
 ### Exact match: `--prompt="(gdb)"`
 
 For REPLs where empty Enter has side effects (gdb repeats last command).
 
 ### Hook: `--prompt=./detect.py`
 
-k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook paths must include a path separator (`/`, or `\` on Windows). The path is canonicalised to absolute at `k new` time; the hook file must exist and be executable (`chmod +x`).
+k feeds ANSI-stripped lines to hook's stdin. Hook exits when frame ends. k pops the last line (= the boundary). Hook paths must include a path separator (`/`). The path is canonicalised to absolute at `k new` time; the hook file must exist and be executable (`chmod +x`).
 
 ```python
 #!/usr/bin/env python3
@@ -121,13 +123,13 @@ k does not classify command output. If the REPL returned to its prompt, status i
 
 ```bash
 k fire work "make build"
-# {"cell_id":"abc123","status":"fired"}
+# {"cell_id":"a1b2c3d4e5f6","status":"fired"}
 
 k poll work
-# {"cell_id":"abc123","status":"running"}
+# {"cell_id":"a1b2c3d4e5f6","status":"running"}
 
 k poll work
-# {"cell_id":"abc123","status":"done","output":"..."}
+# {"cell_id":"a1b2c3d4e5f6","status":"done","output":"..."}
 ```
 
 poll is O(1): checks if the background watcher wrote a result file.
@@ -161,14 +163,15 @@ cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
 Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `interrupt failed; use k kill`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
 
 ## Safety Invariants
 
 - One cell per session (O_EXCL lock). Second fire/run refused.
 - Lock acquired BEFORE send — rejected fire/run never touches the REPL.
 - Timeout keeps lock — prevents new commands from mixing with a potentially still-running REPL command. Only `k int` or `k kill` releases.
-- Lock stores bg watcher PID. poll detects orphaned watchers (crash/OOM) via `os.kill(pid, 0)` (POSIX-portable).
+- Completed done-locks are recoverable. If the agent never polls, the next fire/run can clear the done-lock while preserving the result file for explicit `k poll <cell_id>`.
+- Lock stores the bg watcher process group. poll detects orphaned watchers (crash/OOM) via `os.killpg(pgid, 0)` (POSIX).
 - Code sent via per-session named paste-buffer (no cross-session collision).
 - tmux width 10000: prevents line wrapping that would skew echo_count.
 - Session names validated: `[A-Za-z0-9_.-]+`, no path traversal.
@@ -179,18 +182,21 @@ Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock upda
 ## Metadata on Disk
 
 ```
-/tmp/k_cells/<session>/
+$XDG_RUNTIME_DIR/k_cells/<session>/    (or /tmp/k_cells_<uid>/<session>/)
   _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pid, timed_out?}
+  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, terminal_status?}
   _output.log         pipe-pane stream (append-only)
   <cell_id>_result.json  stream processor output (deleted after poll)
 ```
 
 ## Known Limitations
 
+agent-tty is POSIX-only. It requires tmux, tail, and POSIX process signals.
+WSL is fine; native Windows fails fast.
+
 **Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
 
-**echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
+**echo_count heuristic**: generic REPL mode assumes 1 sent line = 1 echoed line. Bash multiline cells avoid this by sourcing a private per-cell script; other REPLs still rely on prompt filtering or hook/exact prompt mode.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
@@ -258,11 +264,13 @@ Without `-1`, `km` streams all events indefinitely. For multi-cell orchestration
 ### Events
 
 ```
-fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}
-done:    {"cell_id": "...", "session": "...", "status": "done",   "ts": "..."}
-notify:  {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
-closed:  {"session": "...", "status": "closed", "ts": "..."}
-error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
+fired:       {"cell_id": "...", "session": "...", "status": "fired",       "ts": "..."}
+done:        {"cell_id": "...", "session": "...", "status": "done",        "ts": "..."}
+timeout:     {"cell_id": "...", "session": "...", "status": "timeout",     "ts": "..."}
+interrupted: {"cell_id": "...", "session": "...", "status": "interrupted", "ts": "..."}
+notify:      {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
+closed:      {"session": "...", "status": "closed", "ts": "..."}
+error:       {"session": "...", "status": "error",  "message": "...", "ts": "..."}
 ```
 
 ## Testing

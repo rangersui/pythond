@@ -28,39 +28,18 @@ import sys
 import os
 import re
 import json
+import shlex
 import signal
 import subprocess
-import shutil
 
 from datetime import datetime, timezone
 
-TMUX = shutil.which("tmux") or "tmux"
-
-_SAFE_NAME = re.compile(r'^[A-Za-z0-9_.-]+$')
-def _validate_name(s):
-    if not s or not _SAFE_NAME.match(s) or '..' in s:
-        print(f"km: invalid session name: {s!r}", file=sys.stderr)
-        sys.exit(1)
-
-ANSI_RE = re.compile(
-    r"\x1b\[[0-9;]*[a-zA-Z]"
-    r"|\x1b\[<[0-9;]*[mM]"
-    r"|\x1b\[\?[0-9;]*[hlsr]"
-    r"|\x1b\][^\x07]*\x07"
-    r"|\x1b\][^\x1b]*\x1b\\"
-    r"|\x1b[()][0-9A-B]"
-    r"|\x1b[>=]"
-    r"|\x1b\x50[^\x1b]*\x1b\\"
-    r"|\x08|\r"
+from agent_tty._shared import (
+    TMUX, ANSI_RE, CELL_DIR,
+    FIRED, DONE, CLOSED, ERROR, NOTIFY,
+    CELL_START_RE, CELL_END_RE, NOTIFY_EVENT_RE,
+    ensure_private_dir, validate_name,
 )
-
-# cell event patterns (written directly to log by k)
-# fired:  ── cell:<hex12> fired ──
-# done:   ── cell:<hex12> done ──
-# notify: ── notify [...] <message> ──
-START_RE  = re.compile(r"^── cell:([0-9a-f]{12}) fired ──$")
-END_RE    = re.compile(r"^── cell:([0-9a-f]{12}) done ──$")
-NOTIFY_RE = re.compile(r"^── notify \[(.+?)\] (.+) ──$")
 
 
 def _emit(d: dict):
@@ -75,45 +54,49 @@ class E:
 
     @staticmethod
     def started(cell_id: str, session: str):
-        _emit({"cell_id": cell_id, "session": session, "status": "fired"})
+        _emit({"cell_id": cell_id, "session": session, "status": FIRED})
 
     @staticmethod
-    def completed(cell_id: str, session: str):
-        _emit({"cell_id": cell_id, "session": session, "status": "done"})
+    def completed(cell_id: str, session: str, status: str = DONE):
+        _emit({"cell_id": cell_id, "session": session, "status": status})
 
     @staticmethod
     def notify(session: str, who: str, message: str):
-        _emit({"session": session, "status": "notify", "from": who, "message": message})
+        _emit({"session": session, "status": NOTIFY, "from": who, "message": message})
 
     @staticmethod
     def closed(session: str):
-        _emit({"session": session, "status": "closed"})
+        _emit({"session": session, "status": CLOSED})
 
     @staticmethod
     def error(session: str, message: str):
-        _emit({"session": session, "status": "error", "message": message})
+        _emit({"session": session, "status": ERROR, "message": message})
 
-
-CELL_DIR = "/tmp/k_cells"
 
 def session_log_path(session: str) -> str:
-    return os.path.join(CELL_DIR, session, "_output.log")
+    return os.path.join(ensure_private_dir(os.path.join(CELL_DIR, session)), "_output.log")
+
+def open_private(path: str, flags: int, mode: str):
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, mode)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def start_pipe(session: str) -> str:
-    """
-    (Re)start pipe-pane. Idempotent — replaces dead/existing pipe.
-    """
+    """(Re)start pipe-pane. Idempotent — replaces dead/existing pipe."""
     logfile = session_log_path(session)
-
-    os.makedirs(os.path.join(CELL_DIR, session), exist_ok=True)
-
-    open(logfile, "a").close()
+    with open_private(logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a"):
+        pass
     subprocess.run(
-        [TMUX, "pipe-pane", "-t", session, f"cat >> '{logfile}'"],
+        [TMUX, "pipe-pane", "-t", session, f"cat >> {shlex.quote(logfile)}"],
         check=True,
     )
-
     return logfile
 
 
@@ -122,8 +105,6 @@ def stop_pipe(session: str, logfile: str, tail_proc=None):
     if tail_proc and tail_proc.poll() is None:
         tail_proc.kill()
         tail_proc.wait()
-    # DON'T stop pipe-pane — k may still need it
-    # DON'T remove log — k owns the session directory
 
 
 def monitor(session: str, cell_id: str = None, oneshot: bool = False):
@@ -139,21 +120,46 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
     def cleanup(*_):
         stop_pipe(session, logfile, tail_proc)
 
-    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
-    signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
+    def request_stop(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
 
     try:
+        # Pre-scan: if awaiting a specific cell, check if it already completed.
+        # Prevents km -1 from hanging when the cell finished before km started.
+        scan_offset = 0
+        if cell_id and oneshot:
+            try:
+                with open(logfile, "rb") as f:
+                    for raw_line in f:
+                        line = ANSI_RE.sub("", raw_line.decode("utf-8", errors="replace")).strip()
+                        if not line:
+                            continue
+                        m = CELL_END_RE.match(line)
+                        if m and m.group(1) == cell_id:
+                            E.completed(cell_id, session, m.group(2))
+                            return 0
+                    scan_offset = f.tell()
+            except OSError:
+                pass
+
         # tail -f: interrupt-driven (inotify on linux, kqueue on mac)
+        # If pre-scanned, start from scan position to cover the race window;
+        # otherwise start from EOF (only new events).
+        if scan_offset > 0:
+            tail_cmd = ["tail", "-c", f"+{scan_offset + 1}", "-f", logfile]
+        else:
+            tail_cmd = ["tail", "-n", "0", "-f", logfile]
+
         tail_proc = subprocess.Popen(
-            ["tail", "-n", "0", "-f", logfile],
+            tail_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            bufsize=1,  # line-buffered
+            bufsize=1,
         )
-
-        # track cells we've seen start (to pair start/end)
-        active_cells = set()
 
         for raw_line in tail_proc.stdout:
             line = ANSI_RE.sub("", raw_line).strip()
@@ -161,27 +167,25 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
                 continue
 
             # check start
-            m = START_RE.match(line)
+            m = CELL_START_RE.match(line)
             if m:
                 cid = m.group(1)
                 if cell_id is None or cid == cell_id:
-                    active_cells.add(cid)
                     E.started(cid, session)
                 continue
 
-            # check done
-            m = END_RE.match(line)
+            # check done/timeout/interrupted
+            m = CELL_END_RE.match(line)
             if m:
-                cid = m.group(1)
+                cid, status = m.group(1), m.group(2)
                 if cell_id is None or cid == cell_id:
-                    active_cells.discard(cid)
-                    E.completed(cid, session)
+                    E.completed(cid, session, status)
                     if oneshot:
                         return 0
                 continue
 
             # check notify
-            m = NOTIFY_RE.match(line)
+            m = NOTIFY_EVENT_RE.match(line)
             if m:
                 who, message = m.group(1), m.group(2)
                 E.notify(session, who, message)
@@ -190,6 +194,9 @@ def monitor(session: str, cell_id: str = None, oneshot: bool = False):
         # tail ended (session died?)
         E.closed(session)
         return 1
+
+    except KeyboardInterrupt:
+        return 0
 
     finally:
         cleanup()
@@ -202,7 +209,7 @@ def main():
         return 0
 
     session = args[0]
-    _validate_name(session)
+    validate_name(session, prefix="km:")
     cell_id = None
     oneshot = False
 

@@ -6,6 +6,13 @@ K="${1:-scripts/k}"
 PASS=0
 FAIL=0
 
+# per-user state dir (must match cli.py _cell_dir logic)
+if [ -n "$XDG_RUNTIME_DIR" ]; then
+    CELL_DIR="$XDG_RUNTIME_DIR/k_cells"
+else
+    CELL_DIR="/tmp/k_cells_$(id -u)"
+fi
+
 check() {
     local name="$1" expect="$2" actual="$3"
     if echo "$actual" | grep -qF "$expect"; then
@@ -18,11 +25,23 @@ check() {
     fi
 }
 
+check_exact() {
+    local name="$1" expect="$2" actual="$3"
+    if [[ "$actual" == "$expect" ]]; then
+        PASS=$((PASS+1))
+    else
+        echo "  ✗ $name"
+        echo "    expect: $(printf '%q' "$expect")"
+        echo "    actual: $(printf '%q' "$actual")"
+        FAIL=$((FAIL+1))
+    fi
+}
+
 out() { python3 -c "import sys,json;print(json.load(sys.stdin)['output'])" 2>/dev/null; }
 cid() { python3 -c "import sys,json;print(json.load(sys.stdin)['cell_id'])" 2>/dev/null; }
 
 cleanup() { for s in "$@"; do $K kill "$s" 2>/dev/null; done; }
-reset() { for s in w p d; do rm -rf /tmp/k_cells/$s; tmux kill-session -t $s 2>/dev/null; done; }
+reset() { for s in w p d; do rm -rf "$CELL_DIR/$s"; tmux kill-session -t $s 2>/dev/null; done; }
 
 # ═══════════════════════════════════════════
 echo "═══ agent-tty test suite ═══"
@@ -53,6 +72,8 @@ cleanup w
 reset
 echo "── bash multi-line ──"
 $K new w bash >/dev/null; sleep 1
+OUT="$($K run -j w $'echo first\necho second' | out)"
+check_exact "two-line-output" $'first\nsecond' "$OUT"
 check "for" "c" "$($K run -j w '
 for i in a b c; do
     echo $i
@@ -75,7 +96,7 @@ cleanup w
 # ── PYTHON ──
 reset
 echo "── python ──"
-$K new p python3 -i >/dev/null; sleep 1
+$K new p env PYTHON_BASIC_REPL=1 python3 -i >/dev/null; sleep 1
 check "py-print"    "42"        "$($K run -j p 'print(42)')"
 check "py-error"    "Traceback" "$($K run -j p '1/0')"
 check "py-survives" "alive"     "$($K run -j p "print('alive')")"
@@ -176,8 +197,8 @@ echo "── orphan detection ──"
 $K new w bash >/dev/null; sleep 1
 CID=$($K fire w "sleep 60" | cid)
 sleep 0.5
-BG_PID=$(python3 -c "import json;print(json.load(open('/tmp/k_cells/w/_lock.json'))['bg_pid'])")
-kill -9 "$BG_PID" 2>/dev/null
+BG_PGID=$(python3 -c "import json;print(json.load(open('$CELL_DIR/w/_lock.json'))['bg_pgid'])")
+kill -9 "-$BG_PGID" 2>/dev/null
 sleep 1
 check "orphan"      "watcher died" "$($K poll w "$CID")"
 # sleep 60 is still running in REPL — need to cancel it

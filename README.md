@@ -9,7 +9,7 @@ terminal live, can interrupt with `k int`, or take over with `tmux attach`.
 
 The package is `agent-tty`. The CLI command is `k`, intentionally short to minimise token overhead in agent tool calls. `km` is the companion event monitor.
 
-**Requires tmux 3.0+** — k drives tmux for PTY multiplexing; it does not bundle or replace it.
+**Requires POSIX + tmux 3.0+** — k drives tmux, tail, and POSIX signals; it does not bundle or replace them.
 
 ## Why agent-tty
 
@@ -38,7 +38,7 @@ k run -j py "print(42)"
 
 ## Install
 
-Requires: **Python 3.8+**, **tmux 3.0+**
+Requires: **POSIX**, **Python 3.8+**, **tmux 3.0+**
 
 ```bash
 pip install agent-tty            # → k, km, agent-tty in PATH
@@ -88,7 +88,7 @@ Three modes via `--prompt`:
 | `"(gdb)"`   | exact  | match prompt string                         |
 | `./hook.py` | hook   | stdin lines → hook exit → done            |
 
-Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Hook paths must include a path separator (`/`, or `\` on Windows). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
+Hook protocol: k feeds ANSI-stripped lines to stdin. Hook exits = frame end. Hook paths must include a path separator (`/`). Path is canonicalised to absolute at `k new` time; hook must exist and be executable.
 
 ## How It Works
 
@@ -97,6 +97,7 @@ k fire "echo hello"
   |
   +-- acquires lock (rejected fire = zero side effects)
   +-- sends code via paste-buffer (atomic)
+      bash multiline: writes 0600 temp script, sends "source <script>"
   +-- sends 5 frame Enters (repeat mode only)
   +-- starts background stream processor
   |
@@ -118,9 +119,11 @@ k poll
 | ------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | one cell per session     | O_EXCL lock, acquired before send                                                                           |
 | timeout keeps lock       | lock marked `timed_out`; subsequent polls say `use k int or k kill`                                     |
-| orphan recovery          | bg PID in lock, poll checks `os.kill(pid, 0)` (POSIX)                                                     |
+| completed-cell recovery  | bg watcher marks `completed`; next fire/run can clear a done-lock without losing the result file           |
+| orphan recovery          | bg process group in lock, poll checks `os.killpg(pgid, 0)` (POSIX)                                        |
 | no line-wrap skew        | tmux width 10000                                                                                            |
 | atomic send              | per-session named paste-buffer `k_{session}`                                                              |
+| bash multiline state     | private per-cell script + `source`, so cd/env/functions persist without interleaved prompt echoes          |
 | ctrl-c safe              | kills watcher, writes `{"status": "error", "output": "interrupted"}`, re-sends frame enters (repeat only) |
 | session name validation  | `[A-Za-z0-9_.-]+`, no `..`, no path traversal                                                           |
 | idempotent pipe restart  | pipe-pane replaced on every fire/run                                                                        |
@@ -140,23 +143,26 @@ cell error:   {"cell_id": "...", "status": "error", "output": "..."}
 ```
 
 Errors without `cell_id`: `no session 'x'`, `active cell 'x'`, `pipe failed: ...`, `send failed: ...`, `no active cell on 'x'`.
-Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `interrupt failed; use k kill`.
+Errors with `cell_id`: `interrupted`, `unknown cell`, `watcher died`, `lock update failed; use k int or k kill`, `lock release failed`, `interrupt failed; use k kill`.
 
 ## Metadata on Disk
 
 ```
-/tmp/k_cells/<session>/
+$XDG_RUNTIME_DIR/k_cells/<session>/    (or /tmp/k_cells_<uid>/<session>/)
   _session.json       {name} or {name, prompt}
-  _lock.json          {cell_id, log_offset, echo_count, bg_pid, timed_out?}
+  _lock.json          {cell_id, log_offset, echo_count, bg_pgid, completed?, timed_out?, terminal_status?}
   _output.log         pipe-pane stream (append-only)
   <cell_id>_result.json  stream processor output (deleted after poll)
 ```
 
 ## Known Limitations
 
+agent-tty is POSIX-only: it requires tmux, tail, and POSIX process signals.
+WSL is fine; native Windows fails fast.
+
 **Frame collision (repeat mode)**: if output contains 5+ consecutive identical non-empty lines, the stream processor falsely detects completion. Extremely rare — 5 identical lines = zero information entropy.
 
-**echo_count heuristic**: assumes 1 sent line = 1 echoed line. Mitigated by tmux width 10000 (no wrapping) and continuation prompt filtering.
+**echo_count heuristic**: generic REPL mode assumes 1 sent line = 1 echoed line. Bash multiline cells avoid this by sourcing a private per-cell script; other REPLs still rely on prompt filtering or hook/exact prompt mode.
 
 **Hook mode**: no `...` filtering (user takes full control). Hook paths must include a path separator to distinguish them from string prompts.
 
@@ -200,11 +206,13 @@ Without `-1`, `km` runs indefinitely — every fired/done/notify event streams a
 ### Events
 
 ```
-fired:   {"cell_id": "...", "session": "...", "status": "fired",  "ts": "..."}
-done:    {"cell_id": "...", "session": "...", "status": "done",   "ts": "..."}
-notify:  {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
-closed:  {"session": "...", "status": "closed", "ts": "..."}
-error:   {"session": "...", "status": "error",  "message": "...", "ts": "..."}
+fired:       {"cell_id": "...", "session": "...", "status": "fired",       "ts": "..."}
+done:        {"cell_id": "...", "session": "...", "status": "done",        "ts": "..."}
+timeout:     {"cell_id": "...", "session": "...", "status": "timeout",     "ts": "..."}
+interrupted: {"cell_id": "...", "session": "...", "status": "interrupted", "ts": "..."}
+notify:      {"session": "...", "status": "notify", "from": "...", "message": "...", "ts": "..."}
+closed:      {"session": "...", "status": "closed", "ts": "..."}
+error:       {"session": "...", "status": "error",  "message": "...", "ts": "..."}
 ```
 
 ## Testing

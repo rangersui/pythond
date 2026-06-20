@@ -147,14 +147,14 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
 
 <span class="comment"># run code, get JSON</span>
 <span class="prompt">$ </span><span class="cmd">k run -j work "echo hello"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"hello"</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"hello"</span>}</span>
 
 <span class="comment"># state survives across cells</span>
 <span class="prompt">$ </span><span class="cmd">k run -j work "cd /tmp && export MODE=warm"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">""</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"d4e5f6a7b8c9"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">""</span>}</span>
 
 <span class="prompt">$ </span><span class="cmd">k run -j work "pwd; echo $MODE"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"e7f8a9"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"/tmp\nwarm"</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"e7f8a9b0c1d2"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"output"</span>: <span class="json-val">"/tmp\nwarm"</span>}</span>
   </div>
 </div>
 
@@ -173,9 +173,9 @@ footer{border-top:1px solid var(--border);padding:24px 0;text-align:center;color
       <div class="terminal-body">
 <span class="comment"># agent sends a multi-command bash cell</span>
 <span class="prompt">$ </span><span class="cmd">k fire work "cd app && pytest -q && tail -20 logs/server.log && export FIX_READY=1"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
 
-<span class="prompt">$ </span><span class="cmd">km work a1b2c3 -1</span>
+<span class="prompt">$ </span><span class="cmd">km work a1b2c3d4e5f6 -1</span>
 <span class="output">{<span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"ts"</span>: <span class="json-val">"..."</span>}</span>
       </div>
     </div>
@@ -217,7 +217,7 @@ $ export FIX_READY=1
     <div class="feature">
       <div class="icon">&#x1F441;&#xFE0F;</div>
       <h3>Human-visible TTY</h3>
-      <p><code>k watch</code> streams the same live terminal. A human can see progress, interrupt, or attach directly.</p>
+      <p><code>k watch</code> shows a filtered live log (cell markers, completion ticks, frame noise hidden). <code>tmux attach</code> for raw TTY takeover.</p>
     </div>
     <div class="feature">
       <div class="icon">&#x1F9E0;</div>
@@ -232,7 +232,7 @@ $ export FIX_READY=1
     <div class="feature">
       <div class="icon">&#x1F504;</div>
       <h3>JSON cell API</h3>
-      <p><code>run</code> for inline cells, <code>fire</code> for long cells, <code>poll</code> as a fallback. All return structured JSON.</p>
+      <p><code>run -j</code> for inline cells, <code>fire</code>/<code>poll</code> for long cells. Structured JSON with cell_id, status, and output.</p>
     </div>
     <div class="feature">
       <div class="icon">&#x1F3AF;</div>
@@ -254,6 +254,7 @@ $ export FIX_READY=1
   |
   +-- acquires lock (<span class="highlight">O_EXCL</span>, rejected = zero side effects)
   +-- sends code via <span class="highlight">paste-buffer</span> (atomic)
+      bash multiline -> 0600 temp script + <span class="highlight">source</span>
   +-- sends 5 frame enters (repeat mode only)
   +-- starts background <span class="highlight">stream processor</span>
   |
@@ -296,10 +297,10 @@ $ export FIX_READY=1
 
 <span class="comment"># with km: fire a long stateful cell, then wait for its completion event</span>
 <span class="prompt">$ </span><span class="cmd">k fire work "make build"</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"status"</span>: <span class="json-val">"fired"</span>}</span>
 
-<span class="prompt">$ </span><span class="cmd">km work a1b2c3 -1</span>
-<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3"</span>, <span class="json-key">"session"</span>: <span class="json-val">"work"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"ts"</span>: <span class="json-val">"..."</span>}</span>
+<span class="prompt">$ </span><span class="cmd">km work a1b2c3d4e5f6 -1</span>
+<span class="output">{<span class="json-key">"cell_id"</span>: <span class="json-val">"a1b2c3d4e5f6"</span>, <span class="json-key">"session"</span>: <span class="json-val">"work"</span>, <span class="json-key">"status"</span>: <span class="json-val">"done"</span>, <span class="json-key">"ts"</span>: <span class="json-val">"..."</span>}</span>
 
 <span class="comment"># continuous mode: watch all events across a session</span>
 <span class="prompt">$ </span><span class="cmd">km work</span>
@@ -311,11 +312,13 @@ $ export FIX_READY=1
     </div>
   </div>
   <h3 style="text-align:center;margin:32px 0 16px;font-size:1.1rem">Events</h3>
-  <div class="flow"><span class="highlight">fired</span>   {cell_id, session, status: "fired",  ts}
-<span class="highlight">done</span>    {cell_id, session, status: "done",   ts}
-<span class="highlight">notify</span>  {session, status: "notify", from, message, ts}
-<span class="highlight">closed</span>  {session, status: "closed", ts}
-<span class="highlight">error</span>   {session, status: "error",  message, ts}</div>
+  <div class="flow"><span class="highlight">fired</span>        {cell_id, session, status: "fired",       ts}
+<span class="highlight">done</span>         {cell_id, session, status: "done",        ts}
+<span class="highlight">timeout</span>      {cell_id, session, status: "timeout",     ts}
+<span class="highlight">interrupted</span>  {cell_id, session, status: "interrupted", ts}
+<span class="highlight">notify</span>       {session, status: "notify", from, message, ts}
+<span class="highlight">closed</span>       {session, status: "closed", ts}
+<span class="highlight">error</span>        {session, status: "error",  message, ts}</div>
 </section>
 
 <!-- links -->

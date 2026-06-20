@@ -74,7 +74,11 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL), ("k help", K_
 # ── removed/outdated patterns ──
 for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
     check(f"{doc_name}: no old frame-only claim", "Frame delimiter = repeated prompt lines" not in text)
-    check(f"{doc_name}: no status=interrupted schema", '"status": "interrupted"' not in text)
+    # k JSON uses "status":"error","output":"interrupted" — NOT "status":"interrupted"
+    # but km events legitimately emit "status":"interrupted" (terminal status)
+    # so only check the k JSON schema section, not the km events section
+    check(f"{doc_name}: k schema uses error+interrupted not status=interrupted",
+          '"status": "error", "output": "interrupted"' in text)
     check(f"{doc_name}: no pipe-pane -o", "pipe-pane -o" not in text)
     check(f"{doc_name}: no /proc orphan docs", "/proc" not in text)
     check(f"{doc_name}: no bash-wrapped Python tests", "test_contracts.sh" not in text and "test_docs.sh" not in text)
@@ -86,7 +90,7 @@ for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
 for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
     check(f"{doc_name}: km CLI documented", "km <session>" in text)
     check(f"{doc_name}: km -1 flag documented", "-1" in text and "one-shot" in text.lower())
-    for km_status in ("fired", "done", "notify", "closed", "error"):
+    for km_status in ("fired", "done", "timeout", "interrupted", "notify", "closed", "error"):
         check(f"{doc_name}: km event '{km_status}'", f'"status": "{km_status}"' in text)
 
 # ── install + safety ──
@@ -102,7 +106,7 @@ for err in ("lock update failed", "interrupt failed"):
 # ── k JSON error outputs ──
 for doc_name, text in (("README.md", README), ("SKILL.md", SKILL)):
     for err in ("unknown cell", "watcher died", "active cell", "pipe failed", "send failed", "no active cell",
-                 "lock update failed", "interrupt failed"):
+                 "lock update failed", "lock release failed", "interrupt failed"):
         check(f"{doc_name}: error output '{err}'", err in text)
     # cell errors (with cell_id) vs errors (without) are distinguished
     check(f"{doc_name}: cell error schema", "cell error" in text)
