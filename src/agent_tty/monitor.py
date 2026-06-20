@@ -187,14 +187,18 @@ def monitor(session: str, cell_id: str | None = None, oneshot: bool = False) -> 
         else:
             tail_cmd = [TAIL, "-n", "0", "-f", logfile]
 
-        tail_proc = subprocess.Popen(
-            tail_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            errors="replace",
-            bufsize=1,
-        )
+        try:
+            tail_proc = subprocess.Popen(
+                tail_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            E.error(session, f"tail spawn failed: {exc}")
+            return 1
 
         assert tail_proc.stdout is not None
         for raw_line in tail_proc.stdout:
@@ -253,6 +257,9 @@ def main() -> int:
         if arg == "-1":
             oneshot = True
         elif CELL_ID_RE.match(arg):
+            if cell_id is not None:
+                print("ERR only one cell_id allowed", file=sys.stderr)
+                return 1
             cell_id = validate_cell_id(arg)
         else:
             print(f"unknown arg: {arg}", file=sys.stderr)

@@ -115,7 +115,7 @@ k await  ...                                   alias for run
 k notify [session] <message>                   notification (direct to log)
 k int    [session]                             ctrl-c (+ re-frame in repeat mode)
 k kill   <session>                             kill + cleanup
-k ls                                           list sessions
+k ls                                           list tmux sessions
 k status [session]                             health + next action
 k watch  [session]                             live filtered view
 k history [-n N] [session]                     last N×5 lines (default 5)
@@ -369,7 +369,7 @@ python tests/test_contracts.py      # static code contracts, no tmux
 python tests/test_bridge_contracts.py # Codex bridge type-seal contracts, no app-server
 python tests/test_docs.py           # docs/package drift, no tmux
 python -m mypy --platform linux src vendor tests # POSIX type surface
-bash tests/test.sh                  # 66 tests (64 without gdb), runtime smoke suite
+bash tests/test.sh                  # 67 tests (65 without gdb), runtime smoke suite
 python tests/test_regressions.py    # targeted audit regressions
 python tests/run_all.py             # all suites
 ```

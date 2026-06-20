@@ -12,7 +12,7 @@ Usage:
   k notify [session] <message>                notification
   k int    [session]                          ctrl-c
   k kill   <session>                          kill + cleanup
-  k ls                                        list sessions
+  k ls                                        list tmux sessions
   k status [session]                          health + next action
   k watch  [session]                          live filtered view
   k history [-n N] [session]                  last N*5 lines (default 5)
@@ -241,16 +241,22 @@ def _parse_positive_int(raw: str, option: str, usage: str) -> int | None:
         return None
     return value
 
-def _watcher_pgid(meta: CellMeta) -> Any:
-    """Return watcher process group id."""
-    return meta.get("bg_pgid")
+def _watcher_pgid(meta: CellMeta) -> int | None:
+    """Return watcher process group id, or None if absent/malformed."""
+    raw = meta.get("bg_pgid")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return None
 
 def _watcher_alive(meta: CellMeta) -> bool:
     pgid = _watcher_pgid(meta)
-    if not pgid:
+    if pgid is None:
         return False
     try:
-        os.killpg(int(pgid), 0)
+        os.killpg(pgid, 0)
         return True
     except ProcessLookupError:
         return False
@@ -262,9 +268,8 @@ def _watcher_alive(meta: CellMeta) -> bool:
 def _kill_watcher(meta: CellMeta) -> bool:
     """Terminate bg watcher process group. Returns True when it is gone."""
     pgid = _watcher_pgid(meta)
-    if not pgid:
+    if pgid is None:
         return False
-    pgid = int(pgid)
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
@@ -627,7 +632,7 @@ def _pane_last_visible(session: str) -> str | None:
     try:
         r = subprocess.run(
             [TMUX, "capture-pane", "-t", session, "-p"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True, timeout=3, errors="replace",
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -923,6 +928,9 @@ def _send_code(session: str, code: str, prompt: str | None = None) -> None:
 def cmd_new(session: str, cmd_parts: list[str], prompt: str | None = None) -> int:
     validate_name(session)
     if T.has(session):
+        if not _session_exists(session):
+            print(f"ERR tmux session '{session}' exists but is not managed by k")
+            return 1
         print(f"OK {session} (alive)")
         return 0
     # hook mode: path contains / or \ → canonicalize and fail early if missing
@@ -1032,8 +1040,8 @@ def cmd_poll(session: str, cell_id: str | None = None) -> int:
         except (json.JSONDecodeError, OSError):
             # atomic writes make this near-impossible; if it happens,
             # do NOT release lock — state is unknown, let user k int / k kill
-            _json({"cell_id": cell_id, "status": RUNNING})
-            return 0
+            _json({"cell_id": cell_id, "status": ERROR, "output": "result read failed; use k int or k kill"})
+            return 1
         if result.get("status") == TIMEOUT:
             meta = _load_cell(session)
             if meta and meta.get("cell_id") == cell_id and meta.get("timeout_polled"):
@@ -1205,18 +1213,10 @@ def cmd_ls() -> int:
 def cmd_status(session: str) -> int:
     if not _session_exists(session): print(f"ERR {_no_session_output(session)}"); return 1
     logpath = _log(session)
-    pipe_ok = False
     try:
-        if os.path.exists(logpath):
-            before = os.path.getsize(logpath)
-            subprocess.run([TMUX, "send-keys", "-t", session, " ", "BSpace"], capture_output=True)
-            time.sleep(0.2)
-            pipe_ok = (os.path.getsize(logpath) > before)
-        if not pipe_ok:
-            T.pipe_start(session, logpath)
-            pipe = "repaired"
-        else:
-            pipe = "ok"
+        # Idempotent — replaces dead/existing pipe without injecting keys.
+        T.pipe_start(session, logpath)
+        pipe = "ok"
     except (OSError, subprocess.SubprocessError) as e:
         print(f"ERR pipe failed: {e}; use k kill {session}")
         return 1
@@ -1376,6 +1376,7 @@ def main() -> int:
                 if parsed is None: return 1
                 timeout = parsed; rest = rest[2:]
             else: break
+        if not rest: print(usage); return 1
         if len(rest) >= 2: s, c = rest[0], rest[1]; validate_name(s)
         else: s, c = _resolve(), rest[0]
         if not s: print(f"ERR {_no_session_output()}"); return 1

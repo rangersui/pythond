@@ -45,7 +45,7 @@ k await  ...                                   alias for run
 k notify [session] <message>                   notification event
 k int    [session]                             interrupt active cell
 k kill   <session>                             kill + cleanup
-k ls                                           list sessions
+k ls                                           list tmux sessions
 k status [session]                             health + next action
 k watch  [session]                             live filtered view
 k history [-n N] [session]                     last N×5 lines (default 5)

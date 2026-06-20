@@ -220,6 +220,9 @@ check("poll: wrong explicit cell is unknown", 'meta.get("cell_id") != cell_id' i
 check("poll: no bare except on result read", "except: pass" not in poll_seg)
 check("poll: no release on decode error", "corrupt" not in poll_seg,
       "JSONDecodeError must not release lock")
+check("poll: decode error returns error not running",
+      '"status": ERROR' in poll_seg and '"result read failed' in poll_seg,
+      "corrupt result file must surface as error, not hide as running")
 
 int_seg = segment(K_SRC, cmd_int)
 check("int: uses _send_interrupt", "_send_interrupt(" in int_seg)
@@ -273,6 +276,9 @@ check("_parse_positive_int: rejects invalid input", "except ValueError" in parse
 check("_parse_positive_int: rejects zero and negative", "value <= 0" in parse_positive_int_seg)
 check("main: parses user numbers via helper", "_parse_positive_int(rest[1], \"-t\"" in main_seg and "_parse_positive_int(rest[1], \"-n\"" in main_seg)
 check("main: no bare int() on user rest values", "timeout = int(" not in main_seg and "n = int(" not in main_seg)
+check("main: fire guards empty rest after option parsing",
+      'if not rest: print(usage)' in main_seg,
+      "k fire -t N with no code must print usage, not IndexError")
 check("_stream_process: timeout zero is not infinite", "timeout if timeout is not None else None" in stream_seg and "deadline is not None" in stream_seg)
 check("sentinel exceptions: warn before returning fallback", all(needle in K_SRC for needle in (
     "_warn(f\"lock read failed",
