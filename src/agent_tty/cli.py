@@ -102,9 +102,6 @@ class T:
     def kill(s: str) -> None:
         subprocess.run([TMUX, "kill-session", "-t", s], capture_output=True)
     @staticmethod
-    def send(s: str, text: str) -> None:
-        subprocess.run([TMUX, "send-keys", "-t", s, text, "Enter"], check=True)
-    @staticmethod
     def send_enter(s: str) -> None:
         subprocess.run([TMUX, "send-keys", "-t", s, "", "Enter"], check=True)
     @staticmethod

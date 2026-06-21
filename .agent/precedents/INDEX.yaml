@@ -40,3 +40,11 @@
   severity: P2
   status: active
   date: 2026-06-19
+
+- id: audit-pin-to-commit
+  holding: Audit evidence must include full commit SHA, short SHA, commit date, and repo URL.
+  applies_when: producing audit evidence, writing findings reports, reviewing code at a specific version
+  tags: [audit, evidence, git, traceability]
+  severity: P2
+  status: active
+  date: 2026-06-21
