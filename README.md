@@ -44,8 +44,9 @@ Start the daemon in one terminal:
 k daemon
 ```
 
-Stop the daemon with `Ctrl-C` in that terminal. Daemon shutdown terminates owned
-sessions, closes the control socket, and removes TCP `daemon.json` metadata.
+Stop the daemon with `k stop` from a client terminal, or `Ctrl-C` in the daemon
+terminal. Daemon shutdown terminates owned sessions, closes the control socket,
+and removes TCP `daemon.json` metadata.
 
 Use the client from another terminal:
 
@@ -170,6 +171,7 @@ k run work "import subprocess; subprocess.run(['git', 'status'])"
 
 ```text
 k daemon [--show-token]   start daemon in foreground
+k stop                    stop daemon gracefully
 k new <name>              create a Python session
 k int <name>              interrupt running async cells
 k kill <name>             terminate session process and forget it
@@ -231,6 +233,7 @@ Each command has a fixed output style:
 | command | format | shape |
 | --- | --- | --- |
 | `k daemon` | process | foreground daemon; startup line on stderr |
+| `k stop` | text | `OK stopping daemon` or `ERR ...` |
 | `k new` | text | `OK <name> pid=<pid> ...` or `ERR ...` |
 | `k int` | text | `OK interrupted <name> (N cells)` or `ERR ...` |
 | `k kill` | text | `OK killed <name>` or `ERR ...` |

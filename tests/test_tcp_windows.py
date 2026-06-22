@@ -13,7 +13,6 @@ Skip on non-Windows; POSIX PTY coverage lives in test_pty_posix.py.
 import json
 import os
 import queue
-import signal
 import socket
 import subprocess
 import sys
@@ -339,7 +338,8 @@ def main():
 
     finally:
         if daemon.poll() is None:
-            daemon.send_signal(signal.CTRL_BREAK_EVENT)
+            _, out, err = run_k(env, "stop")
+            check("daemon-stop-ok", "OK stopping daemon", out + err)
         try:
             daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:

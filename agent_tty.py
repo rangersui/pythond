@@ -29,6 +29,7 @@ Transport:
 
 Commands:
     k daemon [--show-token]   start daemon in foreground
+    k stop                    stop daemon gracefully
     k new <name>              create a Python session
     k int <name>              interrupt running async cells
     k kill <name>             terminate session process and forget it
@@ -44,7 +45,7 @@ Commands:
 
 Output formats:
     daemon                    foreground process, startup line on stderr
-    new, int, kill, ls,
+    new, int, kill, stop, ls,
     --version, -V, version    text
     run                       raw captured output
     fire, poll, status,
@@ -536,6 +537,7 @@ def session_worker(rx, tx):
 
 sessions = {}
 _daemon_token = None
+_daemon_stop = None
 
 def _start_pty_bridge(pty_read, pty_write):
     """Bridge: PTY <-> attached TCP client.
@@ -800,6 +802,13 @@ def send_session(name, msg, timeout=30):
 
 def handle_client(cmd, args):
     """Handle one daemon control command from a client process."""
+    if cmd == "stop":
+        if args:
+            return "ERR usage: k stop"
+        if _daemon_stop is not None:
+            _daemon_stop.set()
+        return "OK stopping daemon"
+
     if cmd == "new":
         if not args:
             return "ERR usage: k new <name>"
@@ -904,7 +913,8 @@ def daemon(show_token=False):
     cells so humans can observe what the agent is doing.  TCP tokens are written
     to private daemon metadata and are printed only with --show-token.
     """
-    global _daemon_token
+    global _daemon_token, _daemon_stop
+    _daemon_stop = threading.Event()
     srv = _server_socket()
     srv.listen(8)
     srv.settimeout(0.5)
@@ -948,7 +958,7 @@ def daemon(show_token=False):
             pass
 
     try:
-        while True:
+        while not _daemon_stop.is_set():
             try:
                 conn, _ = srv.accept()
             except socket.timeout:
@@ -991,6 +1001,7 @@ def daemon(show_token=False):
             os.unlink(SOCK)
         if not _HAS_AF_UNIX:
             _remove_daemon_meta()
+        _daemon_stop = None
 
 # =============================================
 # CLIENT
