@@ -154,7 +154,7 @@ connection alive inside the local daemon.
 |------|-----|------|----------|
 | Local POSIX | `ws://` over AF_UNIX | socket perms | default |
 | Local Windows | `ws://127.0.0.1:7399` | token | default |
-| Remote | `wss://host:7399` | token, optionally plus mTLS and server pinning | `--listen --tls` |
+| Remote | `wss://host:7399` | token plus pinned self-signed server cert; optionally mTLS | `--listen --tls` |
 
 ## Remote access
 
@@ -164,8 +164,8 @@ pip install pythond
 pyctl start --listen 0.0.0.0:7399 --tls --show-token
 # prints token and fingerprint
 
-# Client: copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem,
-# then pin it before connecting
+# Client: copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem.
+# Remote TLS uses a self-signed cert, so pin before connecting.
 pyctl pin ~/server_cert.pem
 export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=abc... PYTHOND_TLS=1
 pysh new work
@@ -255,8 +255,8 @@ Once authenticated, a client has full access to all sessions — there is no per
 - **Not a sandbox**: code runs with the daemon user's OS permissions
 - **Local POSIX**: AF_UNIX socket with `0o600` permissions
 - **Local Windows**: OWNER RIGHTS DACL via `icacls` — owner-level isolation (comparable to Unix `chmod 700`)
-- **Remote**: TLS (self-signed cert) + token auth, with optional mTLS client cert and server pinning
-- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and stderr for supervisors; logs include `conn_id`, peer, `cmd`, session, status, and `body_bytes`, but never token or code body
+- **Remote**: pinned self-signed TLS cert + token auth, with optional mTLS client cert
+- **Access logs**: daemon writes `ACCESS` lines to runtime `access.log` and mirrors them to daemon stderr for supervisors; logs include `conn_id`, peer, `cmd`, session, status, and `body_bytes`, but never token or code body
 - **Crash isolation**: 5-layer try/except + process isolation — exec errors never kill daemon
 
 ## Operations
@@ -280,8 +280,11 @@ pyctl stop            # graceful daemon shutdown
 
 Logs:
 
-- `ACCESS ...` lines are mirrored to stderr for systemd/supervisor/journald.
+- `ACCESS ...` lines are mirrored to daemon stderr for systemd/supervisor/journald.
 - The same access events are appended to the runtime `access.log`.
+- Interactive `pysh run/fire/fork` also echoes submitted code, errors, and raw
+  `run` output to the client terminal's stderr. That is operator feedback, not
+  daemon access logging.
 - Per-session activity goes to `~/.pythond/sessions/<name>/session.log`.
 - Successful replayable sync execs go to `~/.pythond/sessions/<name>/history.py`.
 - Successful async execs go there when `poll` observes completion.

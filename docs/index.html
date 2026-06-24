@@ -89,7 +89,7 @@ pip install pythond
 pyctl start --listen 0.0.0.0:7399 --tls --show-token
 # prints token and cert fingerprint
 
-# client: pin server cert, then connect
+# client: self-signed server cert must be pinned before connecting
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
 pyctl pin ~/server_cert.pem
 pythond daemon
@@ -171,6 +171,11 @@ pyctl trust &lt;cert.pem&gt;              authorize client
 pyctl pin &lt;cert.pem&gt;                verify server
 </pre>
 
+<p><code>pyctl cert</code> prints the certificate path, key path,
+fingerprint, and role hints: copy this cert to the server for
+<code>pyctl trust</code> when this machine is a client, or copy it to the
+client for <code>pyctl pin</code> when this machine is a server.</p>
+
 <h2>Protocol</h2>
 
 <p>WebSocket text frames. First line = command. After newline = code body.
@@ -202,13 +207,28 @@ ws.send("ls")                          # "  work: alive"
 <tr><th>Mode</th><th>Auth</th></tr>
 <tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600</td></tr>
 <tr><td>Local Windows</td><td>TCP + token, OWNER RIGHTS DACL (owner-level isolation, comparable to Unix chmod 700)</td></tr>
-<tr><td>Remote</td><td>TLS + token; optional mTLS client cert and server pinning</td></tr>
+<tr><td>Remote</td><td>pinned self-signed TLS cert + token; optional mTLS client cert</td></tr>
 </table>
 
 <p>Access logs are written as <code>ACCESS</code> lines to runtime <code>access.log</code>
-and mirrored to stderr for supervisors. They include <code>conn_id</code>, peer,
+and mirrored to daemon stderr for supervisors. They include <code>conn_id</code>, peer,
 <code>cmd</code>, session, status, and <code>body_bytes</code>; they do not include tokens
 or Python code bodies.</p>
+
+<p>Interactive <code>pysh run/fire/fork</code> also echoes submitted code, errors,
+and raw <code>run</code> output to the client terminal's stderr. That is operator
+feedback, not daemon access logging.</p>
+
+<p>Session names are lowercase only: <code>a-z</code>, <code>0-9</code>,
+underscore, and hyphen, up to 80 characters. Windows reserved device names such
+as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and <code>LPT1</code>
+are rejected.</p>
+
+<p>Like shell history and environment variables under SSH, pythond session
+history, logs, and live namespaces can expose secrets. <code>history.py</code>
+and <code>session.log</code> may contain executed Python source and captured
+output. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local files.</p>
 
 <h2>Platform</h2>
 

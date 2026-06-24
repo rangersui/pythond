@@ -189,16 +189,17 @@ connection. Default to transparent alias mode: the local proxy name is also the
 remote session name, so the command shape stays local.
 
 ```bash
-# pin server cert, then connect
+# Remote TLS uses a self-signed server cert; pin it before connecting.
 pyctl pin ~/server_cert.pem
 pyctl connect work 10.0.0.5:7399 <token> --tls
 pysh run work "code"
-pysh fire work "train()"
 pyctl disconnect work
 ```
 
 Use explicit proxy form only when one proxy should address a different remote
 session: `pysh <command> <proxy> <remote-session> "code"`.
+Remote proxy examples currently use `run`; do not document remote async until
+`fire`/`poll` target-session routing is fully covered.
 
 ## Security Model
 
@@ -209,11 +210,13 @@ Treat pythond like SSH into a Python runtime.
   per-session permission isolation.
 - Local POSIX uses an AF_UNIX socket with file permissions.
 - Local Windows uses localhost TCP, token auth, and owner-level directory ACLs.
-- Remote access uses TLS plus token auth; mTLS adds client cert trust and server
-  pinning, but the token is still required.
-- Daemon access logs are written to runtime `access.log` and mirrored to stderr.
+- Remote access uses pinned self-signed TLS plus token auth; mTLS adds client
+  cert trust, but the token is still required.
+- Daemon access logs are written to runtime `access.log` and mirrored to daemon stderr.
   They include `conn_id`, peer, `cmd`, session, status, and `body_bytes`; they
   do not include token values or Python code bodies.
+- Interactive `pysh run/fire/fork` echoes submitted code, errors, and raw `run`
+  output to the client terminal's stderr. Treat that as visible operator output.
 
 Runtime files and durable state are separate:
 
