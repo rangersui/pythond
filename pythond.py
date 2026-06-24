@@ -114,13 +114,17 @@ import signal, subprocess
 import multiprocessing as mp
 import pickle
 import secrets
-import base64
 import hmac
 import re
 import stat
 import ctypes
 import itertools
+import contextlib
 import typing
+import wsproto
+from wsproto import ConnectionType
+from wsproto import events as ws_events
+from wsproto.utilities import LocalProtocolError
 
 __version__ = "0.3.0"
 JsonDict = dict[str, typing.Any]
@@ -131,10 +135,10 @@ _WS_PROTO: typing.Any = f"pythond.{__version__[:3]}"   # e.g. "pythond.0.3"
 _WS_HELLO = "tis but a scratch"
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
 _MAX_WS_PAYLOAD = int(os.environ.get("PYTHOND_MAX_WS_PAYLOAD", str(16 * 1024 * 1024)))
+_MAX_TLS_BRIDGE_THREADS = int(os.environ.get("PYTHOND_MAX_TLS_BRIDGE_THREADS", "256"))
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _BUFFER_CHUNK = 64 * 1024
 _ASYNC_CELL_TTL = 300
-_WS_HANDSHAKE_LIMIT = 64 * 1024
 _ATTACH_READ_SIZE = 1024
 _WIN_ENABLE_PROCESSED_INPUT = 0x0001
 _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
@@ -147,7 +151,6 @@ _INTERRUPT_LOCK = threading.Lock()
 _WORKER_SPAWN_LOCK = threading.Lock()
 _WORKER_ENV = "PYTHOND_INTERNAL_WORKER"
 _SET_ASYNC_EXC: typing.Any = ctypes.pythonapi.PyThreadState_SetAsyncExc
-_SET_ASYNC_EXC.argtypes = [ctypes.c_ulong, ctypes.py_object]
 _SET_ASYNC_EXC.restype = ctypes.c_int
 
 _HAS_AF_UNIX = sys.platform != "win32" and hasattr(socket, "AF_UNIX")
@@ -232,13 +235,9 @@ def _log_history(name: str, src: str) -> None:
     """Append successful exec source to history.py (replayable)."""
     try:
         path = os.path.join(_session_dir(name), "history.py")
-        new_file = not os.path.exists(path)
-        with open(path, "a", encoding="utf-8") as f:
-            if new_file:
-                try:
-                    os.chmod(path, 0o600)
-                except OSError:
-                    pass  # permission hardening -- keep logging best-effort
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                     0o600 if sys.platform != "win32" else 0o666)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}]\n{src}\n")
     except OSError:
         pass  # best-effort -- don't crash if log dir missing
@@ -247,13 +246,9 @@ def _log_session(name: str, src: str, output: str = "", error: bool = False) -> 
     """Append all exec activity to session.log (human readable)."""
     try:
         path = os.path.join(_session_dir(name), "session.log")
-        new_file = not os.path.exists(path)
-        with open(path, "a", encoding="utf-8") as f:
-            if new_file:
-                try:
-                    os.chmod(path, 0o600)
-                except OSError:
-                    pass  # permission hardening -- keep logging best-effort
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                     0o600 if sys.platform != "win32" else 0o666)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             tag = "ERROR" if error else "OK"
             f.write(f"\n# [{time.strftime('%Y-%m-%d %H:%M:%S')}] {tag}\n")
             f.write(f"{src}\n")
@@ -510,20 +505,30 @@ def _generate_cert() -> tuple[str, str]:
     )
     cert_pem = cert.public_bytes(serialization.Encoding.PEM)
 
-    for fpath, data, mode in [
-        (key_path, key_pem, 0o600),
-        (cert_path, cert_pem, 0o644),
-    ]:
-        fd = os.open(fpath,
-                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                     mode if sys.platform != "win32" else 0o666)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if sys.platform != "win32":
-            os.chmod(fpath, mode)
+    tmp_key = key_path + ".tmp"
+    tmp_cert = cert_path + ".tmp"
+    try:
+        for fpath, data, mode in [
+            (tmp_key, key_pem, 0o600),
+            (tmp_cert, cert_pem, 0o644),
+        ]:
+            fd = os.open(fpath,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         mode if sys.platform != "win32" else 0o666)
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if sys.platform != "win32":
+                os.chmod(fpath, mode)
+        os.replace(tmp_key, key_path)
+        os.replace(tmp_cert, cert_path)
+    except Exception:
+        for fpath in (tmp_key, tmp_cert):
+            with contextlib.suppress(OSError):
+                os.unlink(fpath)
+        raise
 
     return cert_path, key_path
 
@@ -565,6 +570,8 @@ def trust_cert(cert_path: str, direction: str = "client") -> tuple[str, str]:
     """
     td = _trusted_clients_dir() if direction == "client" else _trusted_servers_dir()
     fp = _cert_fingerprint(cert_path)
+    if fp == "unknown":
+        raise RuntimeError("invalid certificate")
     name = fp.replace(":", "")[:16] + ".pem"
     dest = os.path.join(td, name)
     import shutil
@@ -605,11 +612,15 @@ class _TlsTerminatedServer:
         self._ssl_ctx = ssl_ctx
         self._inner = ws_serve(handler, "127.0.0.1", 0,
                                subprotocols=subprotocols)
-        inner_addr = self._inner.socket.getsockname()
-        self._inner_port = inner_addr[1]
-        self._sock = socket.create_server((host, port))
-        self._sock.settimeout(1.0)
-        self._threads: list[threading.Thread] = []
+        try:
+            inner_addr = self._inner.socket.getsockname()
+            self._inner_port = inner_addr[1]
+            self._sock = socket.create_server((host, port))
+            self._sock.settimeout(1.0)
+            self._threads: list[threading.Thread] = []
+        except Exception:
+            self._inner.shutdown()
+            raise
 
     def serve_forever(self) -> None:
         t = threading.Thread(target=self._inner.serve_forever, daemon=True)
@@ -623,6 +634,9 @@ class _TlsTerminatedServer:
                 continue
             except OSError:
                 break
+            if len(self._threads) >= _MAX_TLS_BRIDGE_THREADS:
+                raw.close()
+                continue
             worker = threading.Thread(target=self._handle, args=(raw,),
                                       daemon=True)
             worker.start()
@@ -1049,11 +1063,14 @@ def _dispatch(
                     r["output"] = data.get("output", "")
                     r["_error"] = bool(data.get("_error", False))
                     merged = data.get("diff", {})
-                    if lock:
-                        with lock:
-                            ns.update(merged)
+                    if r["_error"]:
+                        merged = {}
                     else:
-                        ns.update(merged)
+                        if lock:
+                            with lock:
+                                ns.update(merged)
+                        else:
+                            ns.update(merged)
                     r["_merged"] = list(merged.keys())
                     r["_skipped"] = data.get("skipped", [])
                 else:
@@ -1103,7 +1120,7 @@ def _dispatch(
                         ctypes.py_object(KeyboardInterrupt),
                     )
                     if rc > 1:
-                        _SET_ASYNC_EXC(ctypes.c_ulong(tid), ctypes.py_object(None))
+                        _SET_ASYNC_EXC(ctypes.c_ulong(tid), None)
                     if rc >= 1:
                         threads += 1
                 elif pid:
@@ -1121,6 +1138,8 @@ def _dispatch(
             with _cells_lock:
                 cell = cells.get(target)
                 _evict_stale_cells(cells)
+                if cell is not None:
+                    cell = dict(cell)
             if cell is None:
                 return {"cell_id": target, "status": "error",
                          "output": "unknown cell"}
@@ -1141,6 +1160,7 @@ def _dispatch(
                 cells.items(),
                 key=lambda item: typing.cast(int, item[1].get("_seq", -1)),
             )
+            r = dict(r)
         resp = {"cell_id": last_id, "status": r["status"],
                  "output": r["output"]}
         if r.get("_error"):
@@ -1179,9 +1199,12 @@ def _dispatch(
         else:
             ns_snapshot = dict(ns)
         c = rlcompleter.Completer(ns_snapshot)
-        matches = []
+        matches: list[str] = []
         for i in range(200):
-            m = c.complete(text, i)
+            try:
+                m = c.complete(text, i)
+            except Exception:
+                return {"matches": matches, "_error": True}
             if m is None:
                 break
             matches.append(m)
@@ -1227,22 +1250,28 @@ def session_worker_pty(ai_sock: socket.socket) -> None:
     def _ai_loop() -> None:
         rf = ai_sock.makefile("r")
         wf = ai_sock.makefile("w")
-        while True:
-            try:
-                line = rf.readline()
-                if not line:
-                    break
-                msg = json.loads(line)
-                resp = _dispatch(msg["cmd"], msg.get("args", []),
-                                 _exec, cells, ns, lock)
-                wf.write(json.dumps(resp) + "\n")
-                wf.flush()
-            except Exception:
+        try:
+            while True:
                 try:
-                    wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
+                    line = rf.readline()
+                    if not line:
+                        break
+                    msg = json.loads(line)
+                    resp = _dispatch(msg["cmd"], msg.get("args", []),
+                                     _exec, cells, ns, lock)
+                    wf.write(json.dumps(resp) + "\n")
                     wf.flush()
-                except BaseException:
-                    break
+                except Exception:
+                    try:
+                        wf.write(json.dumps({"error": "worker protocol error"}) + "\n")
+                        wf.flush()
+                    except BaseException:
+                        break
+        finally:
+            with contextlib.suppress(OSError):
+                rf.close()
+            with contextlib.suppress(OSError):
+                wf.close()
 
     threading.Thread(target=_ai_loop, daemon=True).start()
 
@@ -1382,20 +1411,31 @@ class PtyBridge:
                 break
             if not data:
                 break
+            send_fn = None
             with self._lock:
                 if self._send_fn:
-                    try:
-                        self._send_fn(data)
-                    except Exception:
-                        self._scrollback.extend(data)
-                        if len(self._scrollback) > self._MAX:
-                            del self._scrollback[:-self._MAX]
-                        self._send_fn = None
-                        self._owner = None
+                    send_fn = self._send_fn
                 else:
                     self._scrollback.extend(data)
                     if len(self._scrollback) > self._MAX:
                         del self._scrollback[:-self._MAX]
+            if send_fn is not None:
+                try:
+                    send_fn(data)
+                except Exception:
+                    with self._lock:
+                        self._scrollback.extend(data)
+                        if len(self._scrollback) > self._MAX:
+                            del self._scrollback[:-self._MAX]
+                        if self._send_fn is send_fn:
+                            self._send_fn = None
+                            self._owner = None
+                else:
+                    with self._lock:
+                        if self._send_fn is not send_fn:
+                            self._scrollback.extend(data)
+                            if len(self._scrollback) > self._MAX:
+                                del self._scrollback[:-self._MAX]
 
 def new_session(name: str) -> None:
     """Create or replace one named Python session."""
@@ -1569,6 +1609,13 @@ def _close_session_resources(s: JsonDict) -> bool:
                     handle.close()
             except OSError:
                 pass  # cleanup must not raise -- resources may already be dead
+        for resource in ("ai_rf", "ai_wf"):
+            try:
+                handle = s.get(resource)
+                if handle is not None:
+                    handle.close()
+            except OSError:
+                pass  # cleanup must not raise -- resources may already be dead
     else:
         if s["proc"].is_alive():
             s["proc"].terminate()
@@ -1600,6 +1647,19 @@ def _monitor_session(name: str) -> None:
             sessions.pop(name, None)
         _close_session_resources(s)
 
+def _recv_session_line(s: JsonDict) -> str | None:
+    """Read one newline-delimited JSON response from the worker socket."""
+    buf = typing.cast(bytes, s.get("_ai_buf", b""))
+    while b"\n" not in buf:
+        chunk = s["ai"].recv(_BUFFER_CHUNK)
+        if not chunk:
+            s["_ai_buf"] = buf
+            return None
+        buf += chunk
+    line, rest = buf.split(b"\n", 1)
+    s["_ai_buf"] = rest
+    return line.decode("utf-8", "replace")
+
 def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
     """Send one AI command to a session and wait for its response.
 
@@ -1620,13 +1680,9 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
             return _send_remote(s, msg, timeout)
         if s["type"] == "pty":
             try:
-                if "ai_wf" not in s:
-                    s["ai_rf"] = s["ai"].makefile("r")
-                    s["ai_wf"] = s["ai"].makefile("w")
                 s["ai"].settimeout(timeout)
-                s["ai_wf"].write(json.dumps(msg) + "\n")
-                s["ai_wf"].flush()
-                line = s["ai_rf"].readline()
+                s["ai"].sendall((json.dumps(msg) + "\n").encode("utf-8"))
+                line = _recv_session_line(s)
                 if not line:
                     return {"error": f"session '{name}' dead -- pysh new {name} to restart"}
                 resp: dict[str, typing.Any] = json.loads(line)
@@ -1677,7 +1733,7 @@ def _client_ssl_ctx() -> _ssl.SSLContext:
     else:
         # no pinned certs -- fall back to system CA bundle
         ctx.check_hostname = True
-        ctx.load_default_certs()
+        ctx.set_default_verify_paths()
         ctx.verify_mode = _ssl.CERT_REQUIRED
     # load client cert for mTLS
     try:
@@ -1690,18 +1746,15 @@ def _client_ssl_ctx() -> _ssl.SSLContext:
     return ctx
 
 
-class _RawWssClient:
-    """Minimal RFC6455 client for WSS command frames.
+class _WsproClient:
+    """WebSocket client over TLS socket, framing by wsproto."""
 
-    websockets.sync.client can fail to send the HTTP upgrade on WSS on this
-    Windows/Python stack.  This client is intentionally narrow: text command
-    frames, text/binary receives, ping/pong, close.  Plain WS and AF_UNIX still
-    use websockets directly.
-    """
-
-    def __init__(self, sock: SocketLike) -> None:
+    def __init__(self, sock: SocketLike, ws: wsproto.WSConnection) -> None:
         self.sock = sock
-        self._recv_buf = b""
+        self.ws = ws
+        self._text_parts: list[str] = []
+        self._bytes_parts: list[bytes] = []
+        self._message_size = 0
 
     @classmethod
     def connect(
@@ -1711,171 +1764,133 @@ class _RawWssClient:
         ssl_ctx: _ssl.SSLContext,
         token: str | None = None,
         timeout: float = 10,
-    ) -> "_RawWssClient":
+    ) -> "_WsproClient":
         raw = socket.create_connection((host, port), timeout=timeout)
         try:
             sock = ssl_ctx.wrap_socket(raw, server_hostname=host)
             sock.settimeout(timeout)
-            key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-            headers = [
-                "GET / HTTP/1.1",
-                f"Host: {host}:{port}",
-                "Upgrade: websocket",
-                "Connection: Upgrade",
-                f"Sec-WebSocket-Key: {key}",
-                "Sec-WebSocket-Version: 13",
-                f"Sec-WebSocket-Protocol: {_WS_PROTO}",
-            ]
+            ws = wsproto.WSConnection(ConnectionType.CLIENT)
+            headers: list[tuple[bytes, bytes]] = []
             if token:
-                headers.append(f"Authorization: Bearer {token}")
-            request = "\r\n".join(headers) + "\r\n\r\n"
-            sock.sendall(request.encode("ascii"))
-            response, leftover = cls._read_http_response(sock)
-            if not response.startswith(b"HTTP/1.1 101 "):
-                raise RuntimeError(response.split(b"\r\n", 1)[0].decode(
-                    "latin1", "replace"))
-            header_map: dict[str, str] = {}
-            for line in response.split(b"\r\n")[1:]:
-                if b":" not in line:
-                    continue
-                key_b, value_b = line.split(b":", 1)
-                header_map[key_b.decode("latin1").strip().lower()] = (
-                    value_b.decode("latin1").strip()
-                )
-            accept = base64.b64encode(_hashlib.sha1(
-                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(
-                    "ascii")).digest()).decode("ascii")
-            if header_map.get("sec-websocket-accept", "") != accept:
-                raise RuntimeError("bad websocket accept")
-            if header_map.get("sec-websocket-protocol") != _WS_PROTO:
-                raise RuntimeError("bad websocket protocol")
-            client = cls(sock)
-            client._recv_buf = leftover
-            return client
+                headers.append((b"Authorization", f"Bearer {token}".encode("ascii")))
+            sock.sendall(ws.send(ws_events.Request(
+                host=f"{host}:{port}",
+                target="/",
+                subprotocols=[_WS_PROTO],
+                extra_headers=headers,
+            )))
+            while True:
+                data = sock.recv(_BUFFER_CHUNK)
+                if not data:
+                    raise RuntimeError("connection closed during handshake")
+                ws.receive_data(data)
+                for event in ws.events():
+                    if isinstance(event, ws_events.AcceptConnection):
+                        if event.subprotocol != _WS_PROTO:
+                            raise RuntimeError("bad websocket protocol")
+                        return cls(sock, ws)
+                    if isinstance(event, ws_events.RejectConnection):
+                        raise RuntimeError(
+                            f"websocket rejected: {event.status_code}"
+                        )
+                    if isinstance(event, ws_events.RejectData):
+                        raise RuntimeError("websocket rejected")
         except Exception:
             raw.close()
             raise
 
-    @staticmethod
-    def _read_http_response(sock: SocketLike) -> tuple[bytes, bytes]:
-        data = b""
-        while b"\r\n\r\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                raise RuntimeError("connection closed during handshake")
-            data += chunk
-            if len(data) > _WS_HANDSHAKE_LIMIT:
-                raise RuntimeError("websocket handshake too large")
-        header, leftover = data.split(b"\r\n\r\n", 1)
-        return header + b"\r\n\r\n", leftover
-
     def send(self, data: str | bytes) -> None:
         if isinstance(data, bytes):
-            opcode = 0x2
-            payload = data
+            payload = self.ws.send(ws_events.BytesMessage(data=data))
         else:
-            opcode = 0x1
-            payload = str(data).encode("utf-8")
-        self._send_frame(opcode, payload)
+            payload = self.ws.send(ws_events.TextMessage(data=str(data)))
+        self.sock.sendall(payload)
 
     def recv(self, timeout: float | None = None) -> str | bytes | object:
         old_timeout = self.sock.gettimeout()
         if timeout is not None:
             self.sock.settimeout(timeout)
         try:
-            message_opcode: int | None = None
-            message_parts: list[bytes] = []
             while True:
-                fin, opcode, payload = self._recv_frame()
-                if opcode in (0x1, 0x2):
-                    if fin:
-                        if opcode == 0x1:
-                            return payload.decode("utf-8", "replace")
-                        return payload
-                    message_opcode = opcode
-                    message_parts = [payload]
-                    continue
-                if opcode == 0x0:
-                    if message_opcode is None:
-                        raise RuntimeError("unexpected websocket continuation")
-                    message_parts.append(payload)
-                    if not fin:
-                        continue
-                    payload = b"".join(message_parts)
-                    opcode = message_opcode
-                    message_opcode = None
-                    message_parts = []
-                if opcode == 0x1:
-                    return payload.decode("utf-8", "replace")
-                if opcode == 0x2:
-                    return payload
-                if opcode == 0x8:
-                    return _WS_CLOSE
-                if opcode == 0x9:
-                    self._send_frame(0xA, payload)
-                    continue
-                if opcode == 0xA:
-                    continue
-                raise RuntimeError(f"unsupported websocket opcode: {opcode}")
+                data = self.sock.recv(_BUFFER_CHUNK)
+                if not data:
+                    raise RuntimeError("websocket closed")
+                self.ws.receive_data(data)
+                for event in self.ws.events():
+                    result = self._handle_event(event)
+                    if result is not None:
+                        return result
+        except (TimeoutError, socket.timeout):
+            self._clear_message()
+            raise
         finally:
             if timeout is not None:
                 self.sock.settimeout(old_timeout)
 
     def close(self) -> None:
         try:
-            self._send_frame(0x8, b"")
-        except OSError:
+            self.sock.sendall(self.ws.send(ws_events.CloseConnection(code=1000)))
+        except (OSError, LocalProtocolError):
             pass
         try:
             self.sock.close()
         except OSError:
             pass
 
-    def _send_frame(self, opcode: int, payload: bytes) -> None:
-        first = 0x80 | opcode
-        length = len(payload)
-        mask = secrets.token_bytes(4)
-        if length < 126:
-            header = bytes([first, 0x80 | length])
-        elif length < (1 << 16):
-            header = bytes([first, 0x80 | 126]) + length.to_bytes(2, "big")
-        else:
-            header = bytes([first, 0x80 | 127]) + length.to_bytes(8, "big")
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(header + mask + masked)
+    def _handle_event(self, event: ws_events.Event) -> str | bytes | object | None:
+        if isinstance(event, ws_events.TextMessage):
+            text_data = typing.cast(str, event.data)
+            self._text_parts.append(text_data)
+            self._message_size += len(text_data.encode("utf-8"))
+            self._check_message_size()
+            if event.message_finished:
+                out_text = "".join(self._text_parts)
+                self._clear_message()
+                return out_text
+            return None
+        if isinstance(event, ws_events.BytesMessage):
+            bytes_data = bytes(event.data)
+            self._bytes_parts.append(bytes_data)
+            self._message_size += len(bytes_data)
+            self._check_message_size()
+            if event.message_finished:
+                out_bytes = b"".join(self._bytes_parts)
+                self._clear_message()
+                return out_bytes
+            return None
+        if isinstance(event, ws_events.CloseConnection):
+            try:
+                self.sock.sendall(self.ws.send(ws_events.CloseConnection(
+                    code=1000,
+                )))
+            except (OSError, LocalProtocolError):
+                pass
+            return _WS_CLOSE
+        if isinstance(event, ws_events.Ping):
+            try:
+                self.sock.sendall(self.ws.send(ws_events.Pong(payload=event.payload)))
+            except (OSError, LocalProtocolError):
+                pass
+            return None
+        if isinstance(event, ws_events.Pong):
+            return None
+        if isinstance(event, ws_events.RejectConnection):
+            raise RuntimeError(f"websocket rejected: {event.status_code}")
+        if isinstance(event, ws_events.RejectData):
+            raise RuntimeError("websocket rejected")
+        return None
 
-    def _recv_frame(self) -> tuple[bool, int, bytes]:
-        header = self._recv_exact(2)
-        fin = bool(header[0] & 0x80)
-        if header[0] & 0x70:
-            raise RuntimeError("unsupported websocket extension bits")
-        opcode = header[0] & 0x0F
-        length = header[1] & 0x7F
-        masked = bool(header[1] & 0x80)
-        if length == 126:
-            length = int.from_bytes(self._recv_exact(2), "big")
-        elif length == 127:
-            length = int.from_bytes(self._recv_exact(8), "big")
-        if length > _MAX_WS_PAYLOAD:
-            raise RuntimeError("websocket frame too large")
-        mask = self._recv_exact(4) if masked else b""
-        payload = self._recv_exact(length)
-        if masked:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        return fin, opcode, payload
+    def _check_message_size(self) -> None:
+        if self._message_size > _MAX_WS_PAYLOAD:
+            self._clear_message()
+            with contextlib.suppress(OSError):
+                self.sock.close()
+            raise RuntimeError("websocket message too large")
 
-    def _recv_exact(self, n: int) -> bytes:
-        data = b""
-        if self._recv_buf:
-            take = min(n, len(self._recv_buf))
-            data += self._recv_buf[:take]
-            self._recv_buf = self._recv_buf[take:]
-        while len(data) < n:
-            chunk = self.sock.recv(n - len(data))
-            if not chunk:
-                raise RuntimeError("websocket closed")
-            data += chunk
-        return data
+    def _clear_message(self) -> None:
+        self._text_parts.clear()
+        self._bytes_parts.clear()
+        self._message_size = 0
 
 
 def _connect_wss(
@@ -1883,16 +1898,21 @@ def _connect_wss(
     port: int,
     token: str | None,
     timeout: float = 10,
-) -> _RawWssClient:
-    return _RawWssClient.connect(host, port, _client_ssl_ctx(), token, timeout)
+) -> _WsproClient:
+    return _WsproClient.connect(host, port, _client_ssl_ctx(), token, timeout)
 
 
 def _parse_host_port(value: str, default_port: int = 7399) -> tuple[str, int]:
     """Parse HOST[:PORT] without treating IPv6 as supported syntax."""
     if ":" in value:
         host, _, port_s = value.rpartition(":")
-        return host, int(port_s)
-    return value, int(os.environ.get("PYTHOND_PORT", str(default_port)))
+        port = int(port_s)
+    else:
+        host = value
+        port = int(os.environ.get("PYTHOND_PORT", str(default_port)))
+    if not (1 <= port <= 65535):
+        raise ValueError("port out of range")
+    return host, port
 
 
 def _open_remote_ws(
@@ -2466,8 +2486,12 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
         if use_unix:
             print(f"pythond pid={os.getpid()} ws://{SOCK} mode={mode}",
                   file=sys.stderr)
-            server = ws_unix_serve(_ws_handler, SOCK,
-                                     subprotocols=[_WS_PROTO])
+            old_umask = os.umask(0o177)
+            try:
+                server = ws_unix_serve(_ws_handler, SOCK,
+                                       subprotocols=[_WS_PROTO])
+            finally:
+                os.umask(old_umask)
             os.chmod(SOCK, 0o600)
         elif listen_addr:
             scheme = "wss" if tls else "ws"
@@ -2565,8 +2589,8 @@ def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
         print("ERR daemon not running -- start: pythond daemon", file=sys.stderr)
         sys.exit(1)
     if resp:
-        print(resp)
-    if fail_on_err and resp.startswith("ERR "):
+        print(resp, file=sys.stderr if resp.startswith("ERR ") else sys.stdout)
+    if resp.startswith("ERR ") and fail_on_err:
         sys.exit(1)
 
 def attach(name: str) -> bool:
@@ -2660,6 +2684,10 @@ def _attach_ws_loop(
             if data is None:
                 continue
             if not data or b"\x1d" in data:  # Ctrl-]
+                before, _, _after = data.partition(b"\x1d")
+                if before:
+                    with contextlib.suppress(Exception):
+                        ws.send(before)
                 break
             try:
                 ws.send(data)
@@ -2706,6 +2734,8 @@ def _attach_ws_pty(ws: WebSocketLike, name: str = "") -> None:
 
 def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
     """Windows raw terminal attach via WebSocket."""
+    if not sys.stdin.isatty():
+        raise RuntimeError("attach requires a TTY")
     import ctypes, msvcrt
     kernel32 = ctypes.windll.kernel32
     # argtypes: HANDLE is pointer-sized (64-bit on x64), not c_int
@@ -2723,8 +2753,8 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> None:
     kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out))
     kernel32.SetConsoleMode(
         stdin_h,
-        old_in.value | _WIN_ENABLE_PROCESSED_INPUT |
-        _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT,
+        (old_in.value | _WIN_ENABLE_PROCESSED_INPUT |
+         _WIN_ENABLE_VIRTUAL_TERMINAL_INPUT) & ~0x0006,
     )
     kernel32.SetConsoleMode(
         stdout_h,
@@ -2910,7 +2940,11 @@ def pyctl_main() -> None:
         if not _HAS_CRYPTO:
             print("ERR: pip install pythond", file=sys.stderr)
             sys.exit(1)
-        dest, fp = trust_cert(argv[1], direction="client")
+        try:
+            dest, fp = trust_cert(argv[1], direction="client")
+        except RuntimeError as e:
+            print(f"ERR {_public_error(e)}", file=sys.stderr)
+            sys.exit(1)
         print(f"trusted client: {fp}")
         print(f"  -> {dest}")
     elif argv[0] == "pin":
@@ -2920,7 +2954,11 @@ def pyctl_main() -> None:
         if not _HAS_CRYPTO:
             print("ERR: pip install pythond", file=sys.stderr)
             sys.exit(1)
-        dest, fp = trust_cert(argv[1], direction="server")
+        try:
+            dest, fp = trust_cert(argv[1], direction="server")
+        except RuntimeError as e:
+            print(f"ERR {_public_error(e)}", file=sys.stderr)
+            sys.exit(1)
         print(f"pinned server: {fp}")
         print(f"  -> {dest}")
     elif argv[0] == "cert":
@@ -2936,6 +2974,7 @@ def pyctl_main() -> None:
         print(f"On client:  pyctl pin {cert}")
     elif argv[0] == "status":
         meta = _read_daemon_meta()
+        alive = False
         if _HAS_AF_UNIX:
             alive = _unix_daemon_alive()
             print(f"socket: {SOCK}")
@@ -2947,6 +2986,8 @@ def pyctl_main() -> None:
             print(f"alive: {alive}")
         else:
             print("no daemon metadata found")
+        if not alive:
+            sys.exit(1)
     else:
         print(f"ERR unknown pyctl command: {argv[0]}", file=sys.stderr)
         print(_PYCTL_HELP, file=sys.stderr)

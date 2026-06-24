@@ -102,6 +102,21 @@ def test_khost_parsing():
         check(f"PYTHOND_HOST={host_str} port", port == exp_port, f"got {port}")
 
 
+def test_parse_host_port_validation():
+    section("_parse_host_port validation")
+    check("parse explicit port",
+          pythond._parse_host_port("example.com:443") == ("example.com", 443))
+    check("parse default port",
+          pythond._parse_host_port("example.com", default_port=1234) ==
+          ("example.com", 1234))
+    for value in ("example.com:0", "example.com:65536"):
+        try:
+            pythond._parse_host_port(value)
+            check(f"reject {value}", False)
+        except ValueError:
+            check(f"reject {value}", True)
+
+
 def test_init_namespace():
     section("_init_namespace")
     ns = pythond._init_namespace()
@@ -715,65 +730,81 @@ def test_wire_message_builder():
           pythond._build_wire_message("status", ["work"]) == "status work")
 
 
-def test_raw_wss_payload_limit():
-    section("RawWssClient payload limit")
-    too_large = pythond._MAX_WS_PAYLOAD + 1
-    frame = bytes([0x81, 127]) + too_large.to_bytes(8, "big")
+class _FakeWsSock:
+    def __init__(self, data: bytes = b""):
+        self.data = bytearray(data)
+        self.sent = bytearray()
+        self.timeout = None
+        self.closed = False
+    def recv(self, n):
+        if not self.data:
+            return b""
+        out = bytes(self.data[:n])
+        del self.data[:n]
+        return out
+    def sendall(self, data):
+        self.sent.extend(data)
+    def gettimeout(self):
+        return self.timeout
+    def settimeout(self, timeout):
+        self.timeout = timeout
+    def close(self):
+        self.closed = True
 
-    class FakeSock:
-        def __init__(self, data):
-            self.data = bytearray(data)
-        def recv(self, n):
-            if not self.data:
-                return b""
-            out = bytes(self.data[:n])
-            del self.data[:n]
-            return out
 
-    client = pythond._RawWssClient(FakeSock(frame))
+def _accepted_ws_pair():
+    client_ws = pythond.wsproto.WSConnection(pythond.ConnectionType.CLIENT)
+    server_ws = pythond.wsproto.WSConnection(pythond.ConnectionType.SERVER)
+    req = client_ws.send(pythond.ws_events.Request(
+        host="example:443",
+        target="/",
+        subprotocols=[pythond._WS_PROTO],
+    ))
+    server_ws.receive_data(req)
+    list(server_ws.events())
+    accept = server_ws.send(
+        pythond.ws_events.AcceptConnection(subprotocol=pythond._WS_PROTO)
+    )
+    client_ws.receive_data(accept)
+    list(client_ws.events())
+    return client_ws, server_ws
+
+
+def test_wspro_client_basic():
+    section("WsproClient basic")
+    client_ws, server_ws = _accepted_ws_pair()
+    sock = _FakeWsSock(server_ws.send(pythond.ws_events.TextMessage(data="hello")))
+    client = pythond._WsproClient(sock, client_ws)
+    check("wsproto text recv", client.recv(timeout=1) == "hello")
+
+    client.send("ping")
+    server_ws.receive_data(bytes(sock.sent))
+    events = list(server_ws.events())
+    check("wsproto text send",
+          any(isinstance(e, pythond.ws_events.TextMessage) and e.data == "ping"
+              for e in events))
+
+    client.close()
+    check("wsproto close writes and closes", sock.closed and len(sock.sent) > 0)
+
+
+def test_wspro_client_payload_limit():
+    section("WsproClient payload limit")
+    client_ws, server_ws = _accepted_ws_pair()
+    old_limit = pythond._MAX_WS_PAYLOAD
+    pythond._MAX_WS_PAYLOAD = 5
     try:
-        client._recv_frame()
-        check("oversize frame rejected", False)
-    except RuntimeError as e:
-        check("oversize frame rejected", "too large" in str(e))
-
-
-def test_raw_wss_leftover_and_fragments():
-    section("RawWssClient leftovers and fragments")
-
-    def server_text(payload, fin=True, opcode=0x1):
-        first = (0x80 if fin else 0x00) | opcode
-        return bytes([first, len(payload)]) + payload
-
-    class FakeSock:
-        def __init__(self, data):
-            self.data = bytearray(data)
-            self.timeout = None
-        def recv(self, n):
-            if not self.data:
-                return b""
-            out = bytes(self.data[:n])
-            del self.data[:n]
-            return out
-        def gettimeout(self):
-            return self.timeout
-        def settimeout(self, timeout):
-            self.timeout = timeout
-
-    client = pythond._RawWssClient(FakeSock(b""))
-    client._recv_buf = server_text(b"ready")
-    check("leftover frame is read", client.recv(timeout=1) == "ready")
-
-    frag = server_text(b"he", fin=False, opcode=0x1) + server_text(b"llo", opcode=0x0)
-    client = pythond._RawWssClient(FakeSock(frag))
-    check("fragmented text assembled", client.recv(timeout=1) == "hello")
-
-    client = pythond._RawWssClient(FakeSock(bytes([0x83, 0])))
-    try:
-        client.recv(timeout=1)
-        check("unknown opcode rejected", False)
-    except RuntimeError as e:
-        check("unknown opcode rejected", "unsupported websocket opcode" in str(e))
+        sock = _FakeWsSock(server_ws.send(
+            pythond.ws_events.BytesMessage(data=b"123456")
+        ))
+        client = pythond._WsproClient(sock, client_ws)
+        try:
+            client.recv(timeout=1)
+            check("oversize message rejected", False)
+        except RuntimeError as e:
+            check("oversize message rejected", "too large" in str(e))
+    finally:
+        pythond._MAX_WS_PAYLOAD = old_limit
 
 
 def test_tls_and_auth_hardening_static():
@@ -799,6 +830,8 @@ def test_connection_hardening_static():
     runtime_seg = src[src.index("def _runtime_dir("):src.index("def _daemon_meta_path(")]
     tls_seg = src[src.index("def _tls_dir("):src.index("def _generate_cert(")]
     private_dir_seg = src[src.index("def _ensure_private_dir("):src.index("def _session_dir(")]
+    log_seg = src[src.index("def _log_history("):src.index("# -----------------------------------------------\n# SOCKET helpers")]
+    trust_cert_seg = src[src.index("def trust_cert("):src.index("class _Servable")]
     cert_dirs_seg = src[src.index("def _trusted_clients_dir("):src.index("def _load_trusted_certs(")]
     cert_gen_seg = src[src.index("def _generate_cert("):src.index("def _cert_fingerprint(")]
     send_all_seg = src[src.index("def _send_all("):src.index("# =============================================\n# SHARED WORKER LOGIC")]
@@ -808,10 +841,16 @@ def test_connection_hardening_static():
     tls_server_seg = src[src.index("class _TlsTerminatedServer:"):src.index("# =============================================\n# SHARED WORKER LOGIC")]
     dispatch_seg = src[src.index("def _dispatch("):src.index("# =============================================\n# POSIX: real PTY worker")]
     monitor_seg = src[src.index("def _monitor_session("):src.index("def send_session(")]
+    send_session_seg = src[src.index("def send_session("):src.index("# -----------------------------------------------\n# REMOTE PROXY")]
     remote_seg = src[src.index("def _send_remote("):src.index("def connect_remote(")]
+    wspro_seg = src[src.index("class _WsproClient"):src.index("def _connect_wss(")]
+    parse_host_port_seg = src[src.index("def _parse_host_port("):src.index("def _open_remote_ws(")]
     resize_seg = src[src.index("def _handle_resize("):src.index("def _handle_ls(")]
     attach_reader_seg = src[src.index("def _attach_reader("):src.index("def _attach_ws_loop(")]
+    attach_loop_seg = src[src.index("def _attach_ws_loop("):src.index("def _attach_ws_pty(")]
     attach_win_seg = src[src.index("def _attach_ws_win("):src.index("def _mp_init(")]
+    client_start = src.index("def client(")
+    client_seg = src[client_start:src.index("def attach(", client_start)]
     pyctl_seg = src[src.index("def pyctl_main("):src.index("if __name__ == \"__main__\":")]
     main_seg = src[src.index("def main("):src.index("def pysh_main(")]
 
@@ -845,10 +884,29 @@ def test_connection_hardening_static():
     check("send recv is bounded", "ws.recv(timeout=30)" in send_seg)
     check("remote opens use helper", "def _open_remote_ws" in src)
     check("close frame has sentinel", "return _WS_CLOSE" in src)
-    check("websocket accept value is case-sensitive",
-          'header_map.get("sec-websocket-accept", "") != accept' in src)
-    check("unknown websocket opcodes fail closed",
-          "unsupported websocket opcode" in src)
+    check("wsproto is used for WSS framing",
+          "import wsproto" in src and "class _WsproClient" in src)
+    check("raw WSS parser removed",
+          "_RawWssClient" not in src and "_WS_HANDSHAKE_LIMIT" not in src)
+    check("wsproto events drive client send/recv",
+          "ws_events.TextMessage" in src and
+          "ws_events.BytesMessage" in src and
+          "ws_events.AcceptConnection" in src)
+    check("wsproto close handles already closed state",
+          "LocalProtocolError" in wspro_seg)
+    check("wsproto close reply uses legal code",
+          "code=1000" in wspro_seg and "code=event.code" not in wspro_seg)
+    check("wsproto timeout clears partial message",
+          "except (TimeoutError, socket.timeout):" in wspro_seg and
+          "self._clear_message()" in wspro_seg)
+    check("wsproto pong write is guarded",
+          "ws_events.Pong" in wspro_seg and
+          "except (OSError, LocalProtocolError):" in wspro_seg)
+    check("oversize wsproto message closes socket",
+          "websocket message too large" in wspro_seg and
+          "self.sock.close()" in wspro_seg)
+    check("host port parser validates range",
+          "1 <= port <= 65535" in parse_host_port_seg)
     check("TLS bridge reaps threads", "def _reap_threads" in src and "self._reap_threads()" in src)
     check("TLS accept loop has timeout",
           "self._sock.settimeout(1.0)" in tls_server_seg and
@@ -859,12 +917,24 @@ def test_connection_hardening_static():
     check("tls dir uses private helper", "_ensure_private_dir" in tls_seg)
     check("private dir rejects insecure POSIX dirs",
           "os.lstat(path)" in private_dir_seg and "st.st_uid" in private_dir_seg)
+    check("log files are created private",
+          "os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT" in log_seg and
+          "0o600" in log_seg)
     check("trusted cert dirs use private helper",
           "_ensure_private_dir" in cert_dirs_seg and "os.makedirs" not in cert_dirs_seg)
+    check("invalid trusted certs are rejected",
+          "invalid certificate" in trust_cert_seg and "unknown.pem" not in trust_cert_seg)
+    check("cert writes are atomic",
+          "os.replace(tmp_key, key_path)" in cert_gen_seg and
+          "os.replace(tmp_cert, cert_path)" in cert_gen_seg)
     check("self-signed cert is not a CA",
           "BasicConstraints(ca=False" in cert_gen_seg and
           "key_cert_sign=False" in cert_gen_seg and
           "crl_sign=False" in cert_gen_seg)
+    check("TLS bridge cleans inner server on bind failure",
+          "self._inner.shutdown()" in tls_server_seg)
+    check("TLS bridge has connection cap",
+          "_MAX_TLS_BRIDGE_THREADS" in tls_server_seg)
     check("new_session rolls back failed registration",
           "_close_session_resources(session)" in new_session_seg)
     check("worker entry has environment capability",
@@ -888,6 +958,9 @@ def test_connection_hardening_static():
     check("fork monitor handles unexpected result failures",
           "(fork result read failed)" in fork_monitor_seg and
           "except Exception:" in fork_monitor_seg)
+    check("failed fork does not merge diff",
+          "if r[\"_error\"]:" in fork_monitor_seg and
+          "merged = {}" in fork_monitor_seg)
     check("fork snapshots while locked",
           "lock.acquire()" in dispatch_seg and "child_pid = os.fork()" in dispatch_seg)
     check("fork closes fds on fork failure",
@@ -897,6 +970,9 @@ def test_connection_hardening_static():
     check("int is serialized and ctypes is module-level",
           "with _INTERRUPT_LOCK:" in dispatch_seg and
           "import ctypes" not in dispatch_seg)
+    check("SetAsyncExc cleanup passes NULL",
+          "_SET_ASYNC_EXC(ctypes.c_ulong(tid), None)" in dispatch_seg and
+          "ctypes.py_object(None)" not in dispatch_seg)
     check("fire publishes tid after start before cell visibility",
           "t.start()" in dispatch_seg and
           "res[\"tid\"] = t.ident" in dispatch_seg and
@@ -904,11 +980,19 @@ def test_connection_hardening_static():
     check("latest poll uses explicit cell sequence",
           "\"_seq\": next(_CELL_SEQ)" in dispatch_seg and
           "list(cells)[-1]" not in dispatch_seg)
+    check("poll snapshots cells under lock",
+          "cell = dict(cell)" in dispatch_seg and
+          "r = dict(r)" in dispatch_seg)
+    check("complete catches completer errors",
+          "return {\"matches\": matches, \"_error\": True}" in dispatch_seg)
     check("stale monitor cannot kill replacement",
           "sessions.get(name) is not s" in monitor_seg)
     check("monitor closes resources under session lock",
           "with _session_lock(s):" in monitor_seg and
           "_close_session_resources(s)" in monitor_seg)
+    check("session command path avoids timeout-sensitive makefile",
+          "makefile" not in send_session_seg and
+          "_recv_session_line" in src)
     check("timed out command channel stays unhealthy",
           "msg.get(\"cmd\") != \"int\"" not in src and "use pysh kill" in src)
     check("remote does not retry after send",
@@ -920,10 +1004,26 @@ def test_connection_hardening_static():
     check("attach reader uses bounded recv",
           "ws.recv(timeout=2)" in attach_reader_seg and
           "except (TimeoutError, socket.timeout):" in attach_reader_seg)
+    check("attach preserves bytes before Ctrl-]",
+          "data.partition(b\"\\x1d\")" in attach_loop_seg and
+          "ws.send(before)" in attach_loop_seg)
     check("windows attach preserves processed input",
           "old_in.value | _WIN_ENABLE_PROCESSED_INPUT" in attach_win_seg)
+    check("windows attach requires TTY",
+          "sys.stdin.isatty()" in attach_win_seg and
+          "attach requires a TTY" in attach_win_seg)
+    check("windows attach clears line and echo input",
+          "& ~0x0006" in attach_win_seg)
+    check("client prints ERR to stderr",
+          "resp.startswith(\"ERR \")" in client_seg and
+          "file=sys.stderr" in client_seg and
+          "else sys.stdout" in client_seg)
     check("pyctl exits nonzero on ERR",
           "fail_on_err=True" in pyctl_seg)
+    check("pyctl status exits nonzero when dead",
+          "if not alive:" in pyctl_seg and "sys.exit(1)" in pyctl_seg)
+    check("unix socket created under private umask",
+          "os.umask(0o177)" in src and "ws_unix_serve" in src)
     check("malformed listen rejected",
           "ERR --listen requires HOST:PORT" in src)
     check("client-visible runtime errors are sanitized",
@@ -1768,6 +1868,7 @@ def main():
         test_version,
         test_listen_addr_parsing,
         test_khost_parsing,
+        test_parse_host_port_validation,
         test_init_namespace,
         test_make_exec_eval,
         test_make_exec_exec,
@@ -1803,8 +1904,8 @@ def main():
         test_cert_generation_no_crypto,
         test_websocket_protocol,
         test_wire_message_builder,
-        test_raw_wss_payload_limit,
-        test_raw_wss_leftover_and_fragments,
+        test_wspro_client_basic,
+        test_wspro_client_payload_limit,
         test_tls_and_auth_hardening_static,
         test_connection_hardening_static,
         test_has_crypto_flag,
