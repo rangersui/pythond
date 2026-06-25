@@ -180,7 +180,7 @@ Use direct remote env vars when each client command can connect straight to the
 remote daemon:
 
 ```bash
-export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=<token> PYTHOND_TLS=1
+export PYTHOND_HOST=10.0.0.5:7984 PYTHOND_TOKEN=<token> PYTHOND_TLS=1
 pysh run work "code"
 ```
 
@@ -191,7 +191,7 @@ remote session name, so the command shape stays local.
 ```bash
 # Remote TLS uses a self-signed server cert; pin it before connecting.
 pyctl pin ~/server_cert.pem
-pyctl connect work 10.0.0.5:7399 <token> --tls
+pyctl connect work 10.0.0.5:7984 <token> --tls
 pysh run work "code"
 pyctl disconnect work
 ```
@@ -251,7 +251,7 @@ pyctl trust ~/client_cert.pem
 
 # client: pin server cert, then connect
 pyctl pin ~/server_cert.pem
-pyctl connect server 10.0.0.5:7399 <token> --tls
+pyctl connect server 10.0.0.5:7984 <token> --tls
 ```
 
 ## REPL Patterns

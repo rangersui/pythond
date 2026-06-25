@@ -603,15 +603,16 @@ def _write_daemon_meta(port: int, token: str) -> None:
             "daemon metadata already points to live daemon "
             f"pid={pid} port={old_port}; stop it before starting another "
             "auto-discoverable TCP daemon")
-    tmp = path + ".tmp"
+    tmp = ""
     data = {"port": int(port), "token": token, "pid": os.getpid()}
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     # On Unix, set file mode 0o600.  On Windows, skip -- parent dir DACL
     # (set by _secure_path_win32) protects the file via inheritance.
     try:
-        fd = os.open(tmp, flags, 0o600) if sys.platform != "win32" else os.open(tmp, flags)
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".",
+            suffix=".tmp",
+            dir=os.path.dirname(path),
+        )
         try:
             os.write(fd, json.dumps(data).encode())
             os.fsync(fd)
@@ -621,13 +622,41 @@ def _write_daemon_meta(port: int, token: str) -> None:
             os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except Exception:
-        if os.path.exists(tmp):
+        if tmp and os.path.exists(tmp):
             try:
                 os.remove(tmp)
             except OSError as e:
                 print(f"WARN: cannot remove temp daemon metadata {tmp}: {e}",
                       file=sys.stderr)
         raise
+
+def _pid_alive(pid: typing.Any) -> bool:
+    """Return whether pid names a currently live process."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    if sys.platform == "win32":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int)
+        if not handle:
+            return False
+        with contextlib.suppress(Exception):
+            kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid_int, 0)
+        return True
+    except OSError:
+        return False
 
 def _read_daemon_meta() -> JsonDict:
     """Read daemon metadata, returning {} when absent or invalid."""
@@ -641,6 +670,8 @@ def _read_daemon_meta() -> JsonDict:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if not isinstance(data, dict):
+        return {}
+    if not _pid_alive(data.get("pid")):
         return {}
     return data
 
@@ -1066,8 +1097,10 @@ class _TlsTerminatedServer:
                     _access_log("mtls", peer=peer, status="rejected",
                                 detail=e.__class__.__name__)
                     raise
-            inner_sock = socket.create_connection(("127.0.0.1",
-                                                   self._inner_port))
+            inner_sock = socket.create_connection(
+                ("127.0.0.1", self._inner_port),
+                timeout=5,
+            )
             self._bridge(tls_sock, inner_sock)
         except Exception as e:
             if tls_sock is None:
@@ -1568,11 +1601,17 @@ def _dispatch(
             # (> pipe buffer ~64KB), child blocks on write until parent reads.
             # waitpid first -> parent waits for child -> child waits for read -> deadlock.
             chunks = []
+            total = 0
+            too_large = False
             try:
                 while True:
                     chunk = os.read(fd, _BUFFER_CHUNK)
                     if not chunk:
                         break
+                    total += len(chunk)
+                    if total > _MAX_WORKER_RESPONSE:
+                        too_large = True
+                        continue
                     chunks.append(chunk)
             except OSError as e:
                 print(f"WARN: fork pipe broken: {e}", file=sys.stderr)
@@ -1590,7 +1629,10 @@ def _dispatch(
             merged_keys: list[str] = []
             skipped: list[str] = []
             try:
-                if chunks:
+                if too_large:
+                    output = "fork result too large; use smaller output"
+                    had_error = True
+                elif chunks:
                     # Trust boundary: child runs arbitrary user code; pickle adds no new capability and is intentional
                     data = pickle.loads(b"".join(chunks))
                     output = data.get("output", "")
@@ -2183,8 +2225,15 @@ def new_session(name: str) -> JsonDict:
                 os.close(master_fd)
             with contextlib.suppress(OSError):
                 ai_parent.close()
-            with contextlib.suppress(Exception):
+            try:
                 p.terminate()
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(Exception):
+                    p.kill()
+                    p.wait(timeout=2)
+            except Exception:
+                pass
             raise
         pty_session: PtySessionDict = {
             "type": "pty", "proc": p, "master_fd": master_fd,
@@ -2414,10 +2463,13 @@ def send_session(name: str, msg: JsonDict, timeout: float = 30) -> JsonDict:
                 s["_unhealthy"] = True
                 return {"error": "timeout -- command channel may be out of sync; "
                         "use pysh int or pysh kill if stuck"}
+            except json.JSONDecodeError:
+                s["_unhealthy"] = True
+                return {"error": "malformed worker response; use pysh kill to restart"}
             except ValueError:
                 s["_unhealthy"] = True
                 return {"error": "worker response too large; use pysh kill to restart"}
-            except (OSError, json.JSONDecodeError):
+            except OSError:
                 s["_unhealthy"] = True
                 return {"error": "session command failed"}
             finally:
@@ -2656,7 +2708,7 @@ def _connect_wss(
     )
 
 
-def _parse_host_port(value: str, default_port: int = 7399) -> tuple[str, int]:
+def _parse_host_port(value: str, default_port: int = 7984) -> tuple[str, int]:
     """Parse HOST[:PORT] without treating IPv6 as supported syntax."""
     if ":" in value:
         host, _, port_s = value.rpartition(":")
@@ -2703,7 +2755,7 @@ def _connect_daemon(timeout: float = 5) -> WebSocketLike:
                                subprotocols=[_WS_PROTO])
 
     meta = _read_daemon_meta()
-    port = int(os.environ.get("PYTHOND_PORT") or meta.get("port") or "7399")
+    port = int(os.environ.get("PYTHOND_PORT") or meta.get("port") or "7984")
     if not (1 <= port <= 65535):
         raise ValueError("port out of range")
     token = token or meta.get("token", "")
@@ -2824,8 +2876,8 @@ def connect_remote(
             resp = resp.decode("utf-8", "replace")
         if resp is _WS_CLOSE:
             return "ERR remote closed during probe"
-        if resp == "ERR auth failed":
-            return "ERR auth failed on remote"
+        if isinstance(resp, str) and resp.startswith("ERR "):
+            return f"ERR remote probe failed: {resp[4:]}"
     except Exception as e:
         print(f"WARN: remote connect probe failed for {name}: {e.__class__.__name__}",
               file=sys.stderr)
@@ -3108,16 +3160,22 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
 
     # --- resolve address & auth ---
     if listen_addr:
-        if ":" in listen_addr:
-            host, _, port_s = listen_addr.rpartition(":")
-            host = host or "0.0.0.0"
-            port = int(port_s)
-        elif listen_addr.isdigit():
-            host = "0.0.0.0"
-            port = int(listen_addr)
-        else:
-            host = listen_addr
-            port = int(os.environ.get("PYTHOND_PORT", "7399"))
+        try:
+            if ":" in listen_addr:
+                host, _, port_s = listen_addr.rpartition(":")
+                host = host or "0.0.0.0"
+                port = int(port_s)
+            elif listen_addr.isdigit():
+                host = "0.0.0.0"
+                port = int(listen_addr)
+            else:
+                host = listen_addr
+                port = int(os.environ.get("PYTHOND_PORT", "7984"))
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except (TypeError, ValueError):
+            print(f"ERR invalid --listen: {listen_addr}", file=sys.stderr)
+            raise SystemExit(1)
         use_unix = False
         _use_mtls = False
         # RCE safety: non-localhost requires TLS
@@ -3151,7 +3209,7 @@ def daemon(show_token: bool = False, listen_addr: str | None = None, tls: bool =
             if os.path.exists(SOCK):
                 os.unlink(SOCK)
         else:
-            port = int(os.environ.get("PYTHOND_PORT", "7399"))
+            port = int(os.environ.get("PYTHOND_PORT", "7984"))
             _daemon_token = secrets.token_hex(16)
             try:
                 _write_daemon_meta(port, _daemon_token)
@@ -3653,14 +3711,15 @@ def _attach_ws_win(ws: WebSocketLike, name: str = "") -> bool:
         if not msvcrt.kbhit():
             time.sleep(0.01)
             return None
-        first = msvcrt.getch()
-        if first in (b"\x00", b"\xe0"):
+        first = msvcrt.getwch()
+        if first in ("\x00", "\xe0"):
             while not stopped.is_set() and not msvcrt.kbhit():
                 time.sleep(0.01)
             if stopped.is_set():
                 return None
-            return first + msvcrt.getch()
-        return first
+            second = msvcrt.getwch()
+            return bytes((ord(first) & 0xFF, ord(second) & 0xFF))
+        return first.encode("utf-8")
 
     def restore_terminal() -> None:
         kernel32.SetConsoleMode(stdin_h, old_in.value)

@@ -86,14 +86,14 @@ the connection the agent can't hold.</p>
 <pre>
 # server
 pip install pythond
-pyctl start --listen 0.0.0.0:7399 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --tls --show-token
 # prints token and cert fingerprint
 
 # client: self-signed server cert must be pinned before connecting
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
 pyctl pin ~/server_cert.pem
 pythond daemon
-pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pyctl connect work 10.0.0.5:7984 &lt;token&gt; --tls
 pysh run work "import platform; platform.node()"
 # remote-host-01
 </pre>
@@ -109,13 +109,13 @@ pyctl cert
 pyctl cert
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
 pyctl trust ~/client_cert.pem
-pyctl start --listen 0.0.0.0:7399 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --tls --show-token
 # cert is required and token is still required
 
 # client: pin server cert, then connect (client cert sent automatically)
 pyctl pin ~/server_cert.pem
 pythond daemon
-pyctl connect work 10.0.0.5:7399 &lt;token&gt; --tls
+pyctl connect work 10.0.0.5:7984 &lt;token&gt; --tls
 pysh run work "x"
 </pre>
 

@@ -153,21 +153,21 @@ connection alive inside the local daemon.
 | Mode | URL | Auth | Use case |
 |------|-----|------|----------|
 | Local POSIX | `ws://` over AF_UNIX | socket perms | default |
-| Local Windows | `ws://127.0.0.1:7399` | token | default |
-| Remote | `wss://host:7399` | token plus pinned self-signed server cert; optionally mTLS | `--listen --tls` |
+| Local Windows | `ws://127.0.0.1:7984` | token | default |
+| Remote | `wss://host:7984` | token plus pinned self-signed server cert; optionally mTLS | `--listen --tls` |
 
 ## Remote access
 
 ```bash
 # Server
 pip install pythond
-pyctl start --listen 0.0.0.0:7399 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --tls --show-token
 # prints token and fingerprint
 
 # Client: copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem.
 # Remote TLS uses a self-signed cert, so pin before connecting.
 pyctl pin ~/server_cert.pem
-export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=abc... PYTHOND_TLS=1
+export PYTHOND_HOST=10.0.0.5:7984 PYTHOND_TOKEN=abc... PYTHOND_TLS=1
 pysh new work
 pysh run work "import platform; platform.node()"
 ```
@@ -183,21 +183,21 @@ pyctl cert
 pyctl cert
 pyctl trust ~/client_cert.pem
 # copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
-pyctl start --listen 0.0.0.0:7399 --tls --show-token
+pyctl start --listen 0.0.0.0:7984 --tls --show-token
 # cert is required and token is still required
 
 # Client: pin server cert, then connect (client cert sent automatically)
 pyctl pin ~/server_cert.pem
-export PYTHOND_HOST=10.0.0.5:7399 PYTHOND_TOKEN=<printed-token> PYTHOND_TLS=1
+export PYTHOND_HOST=10.0.0.5:7984 PYTHOND_TOKEN=<printed-token> PYTHOND_TLS=1
 pysh run work "x"
 ```
 
 ### SSH tunnel
 
 ```bash
-ssh -L 7399:localhost:7399 user@server "pythond daemon --listen 127.0.0.1:7399 --show-token"
+ssh -L 7984:localhost:7984 user@server "pythond daemon --listen 127.0.0.1:7984 --show-token"
 # local:
-export PYTHOND_HOST=127.0.0.1:7399 PYTHOND_TOKEN=<printed-token>
+export PYTHOND_HOST=127.0.0.1:7984 PYTHOND_TOKEN=<printed-token>
 pysh run work "x"
 ```
 
@@ -207,7 +207,7 @@ Local daemon maintains connection to remote daemon. Agent just talks to local.
 
 ```bash
 pythond daemon                                    # local daemon
-pyctl connect work 10.0.0.5:7399 <token> --tls    # proxy alias = remote session
+pyctl connect work 10.0.0.5:7984 <token> --tls    # proxy alias = remote session
 pysh run work "x = 42"                            # forwarded to remote work
 pysh run work "x"                                 # → 42 (remote state)
 pyctl disconnect work
@@ -216,7 +216,7 @@ pyctl disconnect work
 One local proxy can also address a different remote session explicitly:
 
 ```bash
-pyctl connect server 10.0.0.5:7399 <token> --tls  # proxy alias
+pyctl connect server 10.0.0.5:7984 <token> --tls  # proxy alias
 pysh run server gpu "x = 42"                      # remote session = gpu
 ```
 
@@ -266,7 +266,7 @@ Run the daemon in the foreground under your supervisor:
 ```bash
 pythond daemon
 # or
-pyctl start --listen 0.0.0.0:7399 --tls
+pyctl start --listen 0.0.0.0:7984 --tls
 ```
 
 Operational signals:
@@ -285,7 +285,7 @@ Environment knobs:
 | `PYTHOND_HOST` | unset | Client target, `HOST[:PORT]`, for remote or tunneled daemons |
 | `PYTHOND_TOKEN` | from daemon metadata when local TCP | Client auth token override |
 | `PYTHOND_TLS` | unset | Set `1`, `true`, or `yes` for client `wss://` |
-| `PYTHOND_PORT` | `7399` | Default TCP port for daemon/client when no port is explicit |
+| `PYTHOND_PORT` | `7984` | Default TCP port for daemon/client when no port is explicit |
 | `PYTHOND_SOCK` | safe runtime path | POSIX AF_UNIX socket path override |
 | `PYTHOND_MAX_SESSIONS` | `128` | Maximum live sessions per daemon |
 | `PYTHOND_MAX_WS_PAYLOAD` | `16777216` | Maximum WebSocket message payload, bytes |

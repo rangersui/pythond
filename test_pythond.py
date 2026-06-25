@@ -66,10 +66,10 @@ def test_listen_addr_parsing():
     """Cover all branches of listen_addr parsing in daemon()."""
     section("listen_addr parsing")
     cases = [
-        ("0.0.0.0:7399", "0.0.0.0", 7399),
-        (":7399",         "0.0.0.0", 7399),
-        ("7399",          "0.0.0.0", 7399),
-        ("myserver",      "myserver", 7399),
+        ("0.0.0.0:7984", "0.0.0.0", 7984),
+        (":7984",         "0.0.0.0", 7984),
+        ("7984",          "0.0.0.0", 7984),
+        ("myserver",      "myserver", 7984),
         ("myserver:8080", "myserver", 8080),
         ("10.0.0.5:443",  "10.0.0.5", 443),
     ]
@@ -83,7 +83,7 @@ def test_listen_addr_parsing():
             port = int(listen_addr)
         else:
             host = listen_addr
-            port = 7399
+            port = 7984
         check(f"listen={listen_addr} host",
               host == exp_host, f"got {host}")
         check(f"listen={listen_addr} port",
@@ -94,16 +94,16 @@ def test_khost_parsing():
     """Cover all branches of PYTHOND_HOST parsing in _client_socket."""
     section("PYTHOND_HOST parsing")
     cases = [
-        ("10.0.0.5:7399", "10.0.0.5", 7399),
-        ("10.0.0.5",       "10.0.0.5", 7399),
-        ("myhost",         "myhost",   7399),
+        ("10.0.0.5:7984", "10.0.0.5", 7984),
+        ("10.0.0.5",       "10.0.0.5", 7984),
+        ("myhost",         "myhost",   7984),
     ]
     for host_str, exp_h, exp_port in cases:
         if ":" in host_str:
             h, _, p = host_str.rpartition(":")
             port = int(p)
         else:
-            port = 7399
+            port = 7984
             h = host_str
         check(f"PYTHOND_HOST={host_str} h", h == exp_h, f"got {h}")
         check(f"PYTHOND_HOST={host_str} port", port == exp_port, f"got {port}")
@@ -855,6 +855,34 @@ def test_send_session_marks_large_response_unhealthy():
             pythond.sessions.pop(name, None)
 
 
+def test_send_session_marks_malformed_response_unhealthy():
+    section("send_session marks malformed response unhealthy")
+
+    class FakeAi:
+        def __init__(self):
+            self.timeout = None
+        def settimeout(self, timeout):
+            self.timeout = timeout
+        def sendall(self, data):
+            pass
+        def recv(self, size):
+            return b"{bad json}\n"
+
+    name = "__malformed_response__"
+    session = {"type": "pty", "ai": FakeAi()}
+    with pythond._sessions_lock:
+        pythond.sessions[name] = session
+    try:
+        resp = pythond.send_session(name, {"cmd": "status"}, timeout=1)
+        check("malformed response returns distinct error",
+              resp == {"error": "malformed worker response; use pysh kill to restart"},
+              resp)
+        check("malformed response marks unhealthy", session.get("_unhealthy") is True)
+    finally:
+        with pythond._sessions_lock:
+            pythond.sessions.pop(name, None)
+
+
 def test_ai_loop_survives_bad_messages():
     section("AI loop survives bad messages")
     ai_parent, ai_child = socket.socketpair()
@@ -1012,6 +1040,18 @@ def test_daemon_meta_read_missing():
         check("missing returns empty", meta == {})
 
 
+def test_daemon_meta_read_rejects_dead_pid():
+    section("daemon meta read rejects dead pid")
+    with tempfile.TemporaryDirectory() as td:
+        fake_path = os.path.join(td, "daemon.json")
+        with open(fake_path, "w", encoding="utf-8") as f:
+            json.dump({"port": 9999, "token": "stale", "pid": -1}, f)
+        with mock.patch.object(pythond, "_daemon_meta_path",
+                               return_value=fake_path):
+            meta = pythond._read_daemon_meta()
+        check("dead pid returns empty", meta == {}, meta)
+
+
 def test_daemon_meta_read_rejects_symlink():
     section("daemon meta read rejects symlink")
     if sys.platform == "win32" or not hasattr(os, "symlink") or not hasattr(os, "O_NOFOLLOW"):
@@ -1039,7 +1079,8 @@ def test_daemon_meta_tmp_cleanup_on_write_failure():
                 check("write should fail", False)
             except OSError:
                 check("write failed", True)
-            check("tmp removed", not os.path.exists(fake_path + ".tmp"))
+            leftovers = list(Path(td).glob("daemon.json.*.tmp"))
+            check("tmp removed", leftovers == [], leftovers)
 
 
 def test_tcp_daemon_alive_does_not_parse_error_text():
@@ -1058,7 +1099,7 @@ def test_tcp_daemon_alive_does_not_parse_error_text():
 
     fake = FakeWs()
     with mock.patch.object(pythond, "ws_connect", return_value=fake):
-        alive = pythond._tcp_daemon_alive({"port": 7399, "token": "bad"})
+        alive = pythond._tcp_daemon_alive({"port": 7984, "token": "bad"})
     check("error response still means endpoint alive", alive is True)
     check("probe sent ls", fake.sent == ["ls"], fake.sent)
     check("probe closed ws", fake.closed is True)
@@ -1211,7 +1252,7 @@ def test_send_remote_close_retries_and_closes():
 
 
 def test_connect_remote_bytes_auth_failure():
-    section("connect remote bytes auth failure")
+    section("connect remote ERR probe failure")
 
     class FakeWs:
         def send(self, msg):
@@ -1222,8 +1263,9 @@ def test_connect_remote_bytes_auth_failure():
             pass
 
     with mock.patch.object(pythond, "_open_remote_ws", return_value=FakeWs()):
-        resp = pythond.connect_remote("r", "127.0.0.1", 7399, "bad")
-    check("bytes auth failure recognised", resp == "ERR auth failed on remote", resp)
+        resp = pythond.connect_remote("r", "127.0.0.1", 7984, "bad")
+    check("bytes ERR probe failure recognised",
+          resp == "ERR remote probe failed: auth failed", resp)
 
 
 def test_session_command_execution_error_is_err():
@@ -1548,6 +1590,8 @@ def test_connection_hardening_static():
     trust_cert_seg = src[src.index("def trust_cert("):src.index("class _Servable")]
     cert_dirs_seg = src[src.index("def _trusted_clients_dir("):src.index("def _load_trusted_certs(")]
     cert_gen_seg = src[src.index("def _generate_cert("):src.index("def _cert_fingerprint(")]
+    write_meta_seg = src[src.index("def _write_daemon_meta("):src.index("def _pid_alive(")]
+    read_meta_seg = src[src.index("def _read_daemon_meta("):src.index("def _remove_daemon_meta(")]
     send_all_seg = src[src.index("def _send_all("):src.index("# =============================================\n# SHARED WORKER LOGIC")]
     new_session_seg = src[src.index("def new_session("):src.index("def kill_session(")]
     close_session_seg = src[src.index("def _close_session_resources("):src.index("def _monitor_session(")]
@@ -1779,6 +1823,9 @@ def test_connection_hardening_static():
     check("TLS bridge has connection cap",
           "len(self._bridge_threads) >= _MAX_TLS_BRIDGE_THREADS" in tls_server_seg and
           "self._inner_thread" in tls_server_seg)
+    check("TLS bridge inner connect has timeout",
+          "socket.create_connection(" in tls_server_seg and
+          "timeout=5" in tls_server_seg)
     check("TLS bridge failures are access logged",
           "_access_log(\"tls\", peer=addr, status=\"capacity-drop\"" in tls_server_seg and
           "_access_log(\"tls\", peer=peer, status=\"accepted\")" in tls_server_seg and
@@ -1787,6 +1834,12 @@ def test_connection_hardening_static():
     check("new_session rolls back failed registration",
           "_close_session_resources(typing.cast(JsonDict, winpty_session))" in new_session_seg and
           "_close_session_resources(typing.cast(JsonDict, pty_session))" in new_session_seg)
+    check("daemon metadata uses unique temp files",
+          "tempfile.mkstemp(" in write_meta_seg and
+          "path + \".tmp\"" not in write_meta_seg)
+    check("daemon metadata rejects dead pid",
+          "def _pid_alive(" in src and
+          "if not _pid_alive(data.get(\"pid\")):" in read_meta_seg)
     check("posix worker starts in own session before worker code",
           "start_new_session=True" in new_session_seg and
           "os.getsid(0) != os.getpid()" in worker_entry_seg)
@@ -1811,6 +1864,9 @@ def test_connection_hardening_static():
           "os.close(master_fd)" in new_session_seg and
           "ai_parent.close()" in new_session_seg and
           "p.terminate()" in new_session_seg)
+    check("posix bridge setup failure reaps worker",
+          "p.wait(timeout=2)" in new_session_seg and
+          "p.kill()" in new_session_seg)
     check("PTY bridge writes all bytes",
           "lambda d: _write_all(master_fd, d)" in new_session_seg)
     check("kill closes PTY bridge",
@@ -1829,6 +1885,10 @@ def test_connection_hardening_static():
     check("fork monitor handles unexpected result failures",
           "(fork result read failed)" in fork_monitor_seg and
           "except Exception:" in fork_monitor_seg)
+    check("fork monitor bounds result pipe",
+          "total += len(chunk)" in fork_monitor_seg and
+          "if total > _MAX_WORKER_RESPONSE:" in fork_monitor_seg and
+          "fork result too large" in fork_monitor_seg)
     check("failed fork does not merge diff",
           "if had_error:" in fork_monitor_seg and
           "merged = {}" in fork_monitor_seg)
@@ -1926,8 +1986,11 @@ def test_connection_hardening_static():
           "with _session_close_lock(s):" in close_session_seg and
           "if s.get(\"_closed\"):" in close_session_seg and
           "def _close_session_resources_once(" in close_session_seg)
+    check("send_session separates malformed JSON",
+          "except json.JSONDecodeError:" in send_session_seg and
+          "malformed worker response; use pysh kill to restart" in send_session_seg)
     check("send_session marks OSError unhealthy",
-          "except (OSError, json.JSONDecodeError):\n                s[\"_unhealthy\"] = True" in send_session_seg)
+          "except OSError:\n                s[\"_unhealthy\"] = True" in send_session_seg)
     check("send_session marks oversized worker response unhealthy",
           "except ValueError:" in send_session_seg and
           "worker response too large; use pysh kill to restart" in send_session_seg)
@@ -1946,12 +2009,18 @@ def test_connection_hardening_static():
     check("connect_remote rejects close during probe",
           "if resp is _WS_CLOSE:" in connect_remote_seg and
           "remote closed during probe" in connect_remote_seg)
+    check("connect_remote rejects any ERR probe response",
+          "resp.startswith(\"ERR \")" in connect_remote_seg and
+          "remote probe failed" in connect_remote_seg)
     check("websocket dependencies are hard imports",
           "from websockets.sync.client import connect as ws_connect" in src and
           "from websockets.sync.client import unix_connect as ws_unix_connect" in src and
           "websockets required: pip install pythond" not in src)
     check("daemon connector validates fallback port",
           "if not (1 <= port <= 65535):" in connect_daemon_seg)
+    check("listen address parse fails cleanly",
+          "ERR invalid --listen" in daemon_seg and
+          "except (TypeError, ValueError):" in daemon_seg)
     check("default socket fallback uses private runtime dir",
           'f"pythond-{uid}", "pythond.sock"' in default_sock_seg)
     check("pyctl status honours PYTHOND_HOST",
@@ -2006,9 +2075,12 @@ def test_connection_hardening_static():
           "sys.stdin.isatty()" in attach_win_seg and
           "attach requires a TTY" in attach_win_seg)
     check("windows attach consumes extended key bytes together",
-          "first in (b\"\\x00\", b\"\\xe0\")" in attach_win_seg and
-          "return first + msvcrt.getch()" in attach_win_seg and
+          "first in (\"\\x00\", \"\\xe0\")" in attach_win_seg and
+          "return bytes((ord(first) & 0xFF, ord(second) & 0xFF))" in attach_win_seg and
           "while not stopped.is_set() and not msvcrt.kbhit():" in attach_win_seg)
+    check("windows attach reads full unicode chars",
+          "msvcrt.getwch()" in attach_win_seg and
+          "first.encode(\"utf-8\")" in attach_win_seg)
     check("windows attach checks console mode calls",
           "if not kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in)):" in attach_win_seg and
           "if not kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out)):" in attach_win_seg)
@@ -2209,7 +2281,7 @@ def test_pyctl_status_uses_env_endpoint():
             self.closed = True
 
     fake = FakeWs()
-    with mock.patch.dict(os.environ, {"PYTHOND_HOST": "127.0.0.1:7399"}, clear=False), \
+    with mock.patch.dict(os.environ, {"PYTHOND_HOST": "127.0.0.1:7984"}, clear=False), \
          mock.patch.object(pythond, "_connect_daemon", return_value=fake), \
          mock.patch.object(sys, "argv", ["pyctl", "status"]), \
          mock.patch.object(sys, "stdout", io.StringIO()) as out:
@@ -2217,7 +2289,7 @@ def test_pyctl_status_uses_env_endpoint():
     text = out.getvalue()
     check("status sent ls", fake.sent == ["ls"], fake.sent)
     check("status closed ws", fake.closed is True)
-    check("status prints endpoint", "endpoint: 127.0.0.1:7399" in text, text)
+    check("status prints endpoint", "endpoint: 127.0.0.1:7984" in text, text)
     check("status prints alive true", "alive: True" in text, text)
 
 
@@ -3283,6 +3355,7 @@ def main():
         test_close_session_resources_idempotent_under_race,
         test_recv_session_line_response_limit,
         test_send_session_marks_large_response_unhealthy,
+        test_send_session_marks_malformed_response_unhealthy,
         test_ai_loop_survives_bad_messages,
         test_session_dir,
         test_session_capacity_limit,
@@ -3290,6 +3363,7 @@ def main():
         test_log_session,
         test_daemon_meta_roundtrip,
         test_daemon_meta_read_missing,
+        test_daemon_meta_read_rejects_dead_pid,
         test_daemon_meta_read_rejects_symlink,
         test_daemon_meta_tmp_cleanup_on_write_failure,
         test_tcp_daemon_alive_does_not_parse_error_text,
