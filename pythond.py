@@ -192,6 +192,7 @@ def _protocol_version(version: str) -> str:
         raise RuntimeError(f"invalid version: {version}")
     return f"{match.group(1)}.{match.group(2)}"
 
+# Version compatibility, not auth. Auth is token/TLS policy or AF_UNIX fs perms.
 _WS_PROTO: typing.Any = f"pythond.{_protocol_version(__version__)}"
 _WS_HELLO = "tis but a scratch"
 _MAX_SESSIONS = int(os.environ.get("PYTHOND_MAX_SESSIONS", "128"))
@@ -3436,7 +3437,13 @@ def _send(cmd: str, args: list[str]) -> str | None:
         return f"ERR cannot connect: {_public_error(e)}"
 
 def client(cmd: str, args: list[str], fail_on_err: bool = False) -> None:
-    """CLI client for non-interactive commands."""
+    """CLI client for non-interactive commands.
+
+    Exit code: 1 on ERR response (when fail_on_err), 0 otherwise.
+    Shell callers: capture the exit code immediately after the pysh command.
+    In POSIX shells, ; and later successful commands can overwrite $?.
+    In PowerShell, inspect $LASTEXITCODE for native process exit status.
+    """
     resp = _send(cmd, args)
     if resp is None:
         print("ERR daemon not running -- start: pythond daemon", file=sys.stderr)

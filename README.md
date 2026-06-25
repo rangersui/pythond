@@ -278,6 +278,24 @@ pysh status work      # one session's worker health
 pyctl stop            # graceful daemon shutdown
 ```
 
+Environment knobs:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PYTHOND_HOST` | unset | Client target, `HOST[:PORT]`, for remote or tunneled daemons |
+| `PYTHOND_TOKEN` | from daemon metadata when local TCP | Client auth token override |
+| `PYTHOND_TLS` | unset | Set `1`, `true`, or `yes` for client `wss://` |
+| `PYTHOND_PORT` | `7399` | Default TCP port for daemon/client when no port is explicit |
+| `PYTHOND_SOCK` | safe runtime path | POSIX AF_UNIX socket path override |
+| `PYTHOND_MAX_SESSIONS` | `128` | Maximum live sessions per daemon |
+| `PYTHOND_MAX_WS_PAYLOAD` | `16777216` | Maximum WebSocket message payload, bytes |
+| `PYTHOND_MAX_WORKER_RESPONSE` | `16777216` | Maximum single worker response line, bytes |
+| `PYTHOND_MAX_TLS_BRIDGE_THREADS` | `256` | Maximum concurrent TLS bridge threads |
+| `PYTHOND_TLS_BRIDGE_IO_TIMEOUT` | `30` | TLS bridge I/O timeout, seconds |
+
+`PYTHOND_INTERNAL_WORKER` is reserved for daemon-spawned workers; do not set it
+manually.
+
 Logs:
 
 - `ACCESS ...` lines are mirrored to daemon stderr for systemd/supervisor/journald.
@@ -392,8 +410,9 @@ pysh run work "print(sh('echo \$SECRET'))"
 # hunter2  ← env var persisted
 ```
 
-The same pattern works for any interactive subprocess: node, gdb, redis-cli,
-psql. The Python session is the host; everything else lives inside it.
+The same pattern works for many interactive subprocesses: node, redis-cli,
+psql. The Python session is the host; everything else lives inside it. For
+commands that need a real tty, use `pysh attach` instead.
 
 ## Tests
 
