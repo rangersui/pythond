@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pythond"
-version = "0.3.0"
+version = "0.4.0"
 description = "sshd gives you a shell. pythond gives you Python."
 readme = "README.md"
 license = "MIT"
@@ -35,3 +35,17 @@ pyctl = "pythond:pyctl_main"
 [project.urls]
 Homepage = "https://pythond.sh"
 Repository = "https://github.com/rangersui/pythond"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["pythond.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/SKILL.md",
+    "/docs/index.html",
+    "/pyproject.toml",
+    "/pythond.py",
+    "/test_pythond.py",
+]

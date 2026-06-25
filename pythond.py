@@ -146,7 +146,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import datetime as _dt
 import logging
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Suppress websockets handshake tracebacks (nmap probes, curl, etc.).
 # pythond has its own access log; the library's stderr spam is redundant.

@@ -53,13 +53,13 @@ def test_version():
     section("version")
     check("version is string", isinstance(pythond.__version__, str))
     check("version has dots", "." in pythond.__version__)
-    check("version is 0.3.0", pythond.__version__ == "0.3.0")
+    check("version is 0.4.0", pythond.__version__ == "0.4.0")
     check("protocol version keeps two-digit minor",
           pythond._protocol_version("1.10.0") == "1.10")
     check("protocol version accepts major minor",
           pythond._protocol_version("2.0") == "2.0")
     check("ws protocol uses parsed major minor",
-          pythond._WS_PROTO == "pythond.0.3")
+          pythond._WS_PROTO == "pythond.0.4")
 
 
 def test_listen_addr_parsing():
