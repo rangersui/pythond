@@ -7,100 +7,7 @@ runtime JS injection — anti-bot systems cannot detect the patching.
 Read this reference when the task involves web scraping, browsing behind
 anti-bot protection, or interacting with sites that detect automation.
 
-## Two modes
-
-| Mode | Lifecycle | When to use |
-|------|-----------|-------------|
-| `cloakserve` | Independent daemon — survives Python restarts | Long-running, monitoring, persistent tasks |
-| `launch()` | Python owns the process — browser dies with Python | Quick one-off scraping |
-
-Prefer cloakserve. The browser should not depend on the Python process
-for its lifetime — if the session restarts, the browser stays up and
-you just reconnect.
-
-## Setup: cloakserve
-
-### Docker
-
-```bash
-docker run -d --name cloak -p 127.0.0.1:9222:9222 \
-  cloakhq/cloakbrowser cloakserve
-```
-
-With proxy:
-```bash
-docker run -d --name cloak -p 127.0.0.1:9222:9222 \
-  cloakhq/cloakbrowser cloakserve --proxy-server=http://proxy:8080
-```
-
-Docker Compose:
-```yaml
-services:
-  cloakbrowser:
-    image: cloakhq/cloakbrowser
-    command: cloakserve
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9222:9222"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9222/json/version"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-```
-
-### Verify it's running
-
-```python
-import urllib.request, json
-info = json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json/version").read())
-print(info)
-```
-
-## Connect
-
-```python
-from playwright.sync_api import sync_playwright
-
-pw = sync_playwright().start()
-cloak = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-page = cloak.new_page()
-page.goto("https://example.com")
-print(page.title())
-```
-
-`pw` and `cloak` persist in the pythond namespace. Store them once, reuse
-across turns. If the session restarts, just re-run these two lines.
-
-### Per-connection fingerprint
-
-Each connection gets a unique fingerprint seed via query params — different
-canvas, WebGL, fonts, timing for each:
-
-```python
-b1 = pw.chromium.connect_over_cdp("http://localhost:9222?fingerprint=11111")
-b2 = pw.chromium.connect_over_cdp("http://localhost:9222?fingerprint=22222")
-
-# Full customization
-b3 = pw.chromium.connect_over_cdp(
-    "http://localhost:9222?fingerprint=33333"
-    "&timezone=Asia/Tokyo&locale=ja-JP&platform=macos"
-    "&hardware-concurrency=4&device-memory=8"
-)
-
-# Per-connection proxy
-b4 = pw.chromium.connect_over_cdp(
-    "http://localhost:9222?fingerprint=44444"
-    "&proxy=http://proxy:8080&geoip=true"
-)
-```
-
-Query params: `fingerprint`, `timezone`, `locale`, `platform`,
-`platform-version`, `brand`, `brand-version`, `gpu-vendor`, `gpu-renderer`,
-`hardware-concurrency`, `device-memory`, `screen-width`, `screen-height`,
-`proxy`, `geoip`.
-
-## Setup: launch() (quick tasks)
+## Quick start
 
 ```bash
 pip install cloakbrowser
@@ -109,16 +16,18 @@ pip install cloakbrowser
 ```python
 from cloakbrowser import launch
 
-browser = launch(
-    headless=True,
-    proxy="http://user:pass@proxy:8080",
-    humanize=True,
-    geoip=True,
-)
+browser = launch(headless=True, humanize=True)
 page = browser.new_page()
 page.goto("https://example.com")
 print(page.title())
-browser.close()
+```
+
+`browser` and `page` persist in the pythond namespace. Do not call
+`browser.close()` — keep it alive across turns like any other connection.
+
+With proxy and geo-IP:
+```python
+browser = launch(headless=True, humanize=True, proxy="http://user:pass@proxy:8080", geoip=True)
 ```
 
 ## Common operations
@@ -198,21 +107,6 @@ browser = launch(
 )
 ```
 
-## Reconnect
-
-cloakserve stays alive. Just reconnect:
-
-```python
-cloak = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-page = cloak.new_page()
-```
-
-If Playwright died, restart it first:
-```python
-pw = sync_playwright().start()
-cloak = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-```
-
 ## Verify stealth
 
 Run these checks after setup. All three should show no automation detected:
@@ -222,6 +116,84 @@ page.goto("https://abrahamjuliot.github.io/creepjs/")  # trust score > 70% = goo
 page.goto("https://bot.sannysoft.com/")                 # all rows green = good
 page.goto("https://pixelscan.net/")                     # "consistent" verdict = good
 ```
+
+## Advanced: cloakserve (standalone daemon)
+
+Use cloakserve when the browser must outlive Python — e.g. multiple pythond
+sessions sharing one browser, or you need to restart Python without losing
+browser state. For most tasks launch() in a pythond session is simpler and
+sufficient.
+
+### Docker
+
+```bash
+docker run -d --name cloak -p 127.0.0.1:9222:9222 \
+  cloakhq/cloakbrowser cloakserve
+```
+
+With proxy:
+```bash
+docker run -d --name cloak -p 127.0.0.1:9222:9222 \
+  cloakhq/cloakbrowser cloakserve --proxy-server=http://proxy:8080
+```
+
+Docker Compose:
+```yaml
+services:
+  cloakbrowser:
+    image: cloakhq/cloakbrowser
+    command: cloakserve
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9222:9222"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9222/json/version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+```
+
+### Connect
+
+```python
+from playwright.sync_api import sync_playwright
+
+pw = sync_playwright().start()
+cloak = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+page = cloak.new_page()
+page.goto("https://example.com")
+```
+
+`pw` and `cloak` persist in the pythond namespace. If the session restarts,
+re-run these two lines — cloakserve is still up.
+
+### Per-connection fingerprint
+
+Each connection gets a unique fingerprint seed via query params — different
+canvas, WebGL, fonts, timing for each:
+
+```python
+b1 = pw.chromium.connect_over_cdp("http://localhost:9222?fingerprint=11111")
+b2 = pw.chromium.connect_over_cdp("http://localhost:9222?fingerprint=22222")
+
+# Full customization
+b3 = pw.chromium.connect_over_cdp(
+    "http://localhost:9222?fingerprint=33333"
+    "&timezone=Asia/Tokyo&locale=ja-JP&platform=macos"
+    "&hardware-concurrency=4&device-memory=8"
+)
+
+# Per-connection proxy
+b4 = pw.chromium.connect_over_cdp(
+    "http://localhost:9222?fingerprint=44444"
+    "&proxy=http://proxy:8080&geoip=true"
+)
+```
+
+Query params: `fingerprint`, `timezone`, `locale`, `platform`,
+`platform-version`, `brand`, `brand-version`, `gpu-vendor`, `gpu-renderer`,
+`hardware-concurrency`, `device-memory`, `screen-width`, `screen-height`,
+`proxy`, `geoip`.
 
 ## Security
 
