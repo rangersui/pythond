@@ -1,6 +1,6 @@
 ---
 name: pythond
-description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or remote pythond daemon sessions. Also covers stealth web browsing via bundled cloakbrowser reference — use when the task involves scraping, anti-bot evasion, or browser automation that must avoid detection.
+description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or ssh-reached pythond daemon sessions. Also covers stealth web browsing via bundled cloakbrowser reference — use when the task involves scraping, anti-bot evasion, or browser automation that must avoid detection.
 ---
 # pythond
 
@@ -21,8 +21,8 @@ in, captured output out. Do not treat it as a terminal transcript.
 
 One named session is one Python child process with one persistent namespace.
 
-Your cells run through Python `eval`/`exec`. Human attach connects to the same
-namespace. You and the human are operating the same live runtime.
+Your cells run through Python `eval`/`exec`. Human attach is a line REPL into
+the same namespace. You and the human are operating the same live runtime.
 
 ## Default Work Surface
 
@@ -65,7 +65,7 @@ If daemon is not running, start it first. One daemon manages all sessions.
 Each session is an isolated subprocess with its own namespace.
 
 `pyctl start` is an alias for `pythond daemon`. Prefer `pythond daemon` in
-agent workflows; use `pyctl` for daemon management and remote proxy setup.
+agent workflows; use `pyctl` for stop/status.
 
 ## Core Commands
 
@@ -75,7 +75,7 @@ pysh run <name> "code"       # sync exec/eval, raw output
 pysh fire <name> "code"      # async thread, shared namespace
 pysh fork <name> "code"      # async process, POSIX only, killable
 pysh poll <name> [cell_id]   # read async result
-pysh attach <name>           # human REPL, Ctrl-] detaches
+pysh attach <name>           # human line REPL, Ctrl-D detaches
 pysh int <name>              # fire=best effort, fork=kill
 pysh kill <name>             # terminate session
 pysh ls                      # list sessions
@@ -119,6 +119,9 @@ pysh int work                # kills fork'd process
 
 `fire` cells in one session run serially under the session lock. Use multiple
 sessions for real parallelism.
+
+Long `run` cells: the command channel times out at 30s and the session must
+then be killed. Anything that might exceed that goes through `fire` or `fork`.
 
 ## State Persists
 
@@ -168,90 +171,69 @@ The file is transport. The namespace is the workspace.
 | `ls`                     | text listing                                   |
 | `new`, `kill`, `int` | text confirmation or error                     |
 
-Errors in `run` return traceback text but do not kill the session.
+Errors in `run` return traceback text (and exit code 1) but do not kill the
+session.
 
 ## Remote Sessions
 
-Remote work has two modes.
-
-Use direct remote env vars when each client command can connect straight to the
-remote daemon:
+Remote access is ssh. The state lives in the remote daemon, not in the
+connection, so one-shot calls are enough:
 
 ```bash
-export PYTHOND_HOST=10.0.0.5:7984 PYTHOND_TOKEN=<token> PYTHOND_TLS=1
+ssh server pysh run work "x = 42"
+ssh server pysh run work "x + 1"     # → 43 (remote state)
+```
+
+For per-call latency, enable ssh connection reuse once in `~/.ssh/config`:
+
+```
+Host server
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+Interactive human access: `ssh -t server pysh attach work`.
+
+Tunneled mode (client-side pysh against a forwarded port):
+
+```bash
+ssh -L 7984:127.0.0.1:7984 server
+export PYTHOND_HOST=127.0.0.1:7984 PYTHOND_TOKEN=<remote-token>
 pysh run work "code"
 ```
 
-Use a local proxy daemon when a one-shot shell tool cannot hold the remote
-connection. Default to transparent alias mode: the local proxy name is also the
-remote session name, so the command shape stays local.
+## Direct HTTP (debugging)
+
+The daemon speaks plain HTTP; curl is the debug client:
 
 ```bash
-# Non-loopback pyctl start/pythond daemon listeners auto-enable TLS.
-# Remote TLS uses a self-signed server cert; pin it before connecting.
-pyctl pin ~/server_cert.pem
-pyctl connect work 10.0.0.5:7984 <token> --tls
-pysh run work "code"
-pyctl disconnect work
+curl --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock \
+     --data-binary '1 + 1' http://pythond/run/work    # → 2
 ```
 
-Use explicit proxy form only when one proxy should address a different remote
-session: `pysh <command> <proxy> <remote-session> "code"`.
-Remote proxy examples currently use `run`; do not document remote async until
-`fire`/`poll` target-session routing is fully covered.
+Python source goes in the request body, raw -- never JSON-escaped. Normal use
+is `pysh`; the HTTP API is documented in the README.
 
 ## Security Model
 
 Treat pythond like SSH into a Python runtime.
 
 - Not a sandbox: code runs with the daemon user's OS permissions.
-- Once authenticated, a client has full access to all sessions; there is no
+- Once connected, a client has full access to all sessions; there is no
   per-session permission isolation.
-- Local POSIX uses an AF_UNIX socket with file permissions.
-- Local Windows uses localhost TCP, token auth, and owner-level directory ACLs.
-- Remote access uses pinned self-signed TLS plus token auth; mTLS adds client
-  cert trust, but the token is still required.
-- Daemon access logs are written to runtime `access.log` and mirrored to daemon stderr.
-  They include `conn_id`, peer, `cmd`, session, status, and `body_bytes`; they
-  do not include token values or Python code bodies.
+- Local POSIX uses a unix socket with file permissions.
+- Local Windows uses loopback TCP plus a bearer token in
+  `%LOCALAPPDATA%\pythond\daemon.json`.
+- The daemon never binds a non-loopback address; remote exposure is ssh's (or
+  a reverse proxy's) job.
 
 Runtime files and durable state are separate:
 
-| Purpose              | Windows                                                                       | POSIX                                                   |
-| -------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------- |
-| daemon metadata/logs | `%LOCALAPPDATA%\pythond\daemon.json`, `%LOCALAPPDATA%\pythond\access.log` | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
-| session state/certs  | `~\.pythond\sessions\...`, `~\.pythond\tls\...`                           | `~/.pythond/sessions/...`, `~/.pythond/tls/...`     |
-
-### TLS cert management
-
-```bash
-pyctl cert                     # show/generate this machine's cert
-pyctl trust <cert.pem>         # authorize a client (server-side)
-pyctl pin <cert.pem>           # verify a server (client-side)
-```
-
-`pyctl cert` generates a self-signed cert on first run, then shows the path
-on subsequent runs. The output tells you the next step (`pyctl trust` or
-`pyctl pin`).
-
-### mTLS plus token
-
-Both sides authenticate each other. Token is still required.
-
-```bash
-# client: generate client cert
-pyctl cert
-# copy client ~/.pythond/tls/cert.pem to server as ~/client_cert.pem
-
-# server: generate server cert, then trust client cert
-pyctl cert
-# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
-pyctl trust ~/client_cert.pem
-
-# client: pin server cert, then connect
-pyctl pin ~/server_cert.pem
-pyctl connect server 10.0.0.5:7984 <token> --tls
-```
+| Purpose              | Windows                                       | POSIX                                                   |
+| -------------------- | --------------------------------------------- | ------------------------------------------------------- |
+| daemon metadata      | `%LOCALAPPDATA%\pythond\daemon.json`        | `$XDG_RUNTIME_DIR/pythond/` or `/tmp/pythond-$UID/` |
+| session checkpoints  | `~\.pythond\sessions\...`                   | `~/.pythond/sessions/...`                             |
 
 ## REPL Patterns
 
@@ -294,33 +276,21 @@ Successful synchronous `run` cells are appended to
 are appended when `poll` observes completion. If a session dies, replay:
 `pysh run <name> "exec(open(...).read())"`.
 
-Like shell history and environment variables under SSH, pythond session history,
-logs, and live namespaces can expose secrets. `history.py` and `session.log` may
-contain executed Python source and captured output. Variables assigned in a
-session remain in that live Python process until overwritten or the session is
-killed. Do not paste API keys, passwords, tokens, or other secrets into cells
-unless you are willing for them to persist in that session and its local files.
-
-## Protocol Notes
-
-WebSocket text frames. First line = command + args. After first `\n` = code body.
-
-```text
-run work
-print("hello")
-```
-
-Transport: `ws://` (local), `wss://` (remote TLS).
+Like shell history under SSH, pythond session history and live namespaces can
+expose secrets. `history.py` may contain executed Python source. Variables
+assigned in a session remain in that live Python process until overwritten or
+the session is killed. Do not paste API keys, passwords, tokens, or other
+secrets into cells unless you are willing for them to persist in that session
+and its local files.
 
 ## Avoid
 
 - Do not parse ANSI escape sequences; output is already clean text.
 - Do not use `pysh` as a terminal transcript.
-- Do not put Python source inside JSON; send source as the protocol body or load
+- Do not put Python source inside JSON; send source as the request body or load
   it from a file.
 - Do not move task state back into the host shell once a session exists.
-- Do not manage daemon WebSocket lifetimes manually. The CLI may use short
-  connections; remote proxy connections are held by the daemon.
+- Do not run cells that may exceed 30s through `run`; use `fire`/`fork`.
 
 ## References
 
@@ -328,5 +298,5 @@ Bundled reference docs for specific integration patterns. Read the relevant
 file when the task matches.
 
 | File                           | When to read                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `references/cloakbrowser.md` | Task involves web scraping, browsing behind anti-bot protection, or interacting with sites that detect automation. Default: `launch()` in a pythond session — one line, browser lives in the namespace. Advanced: cloakserve daemon for multi-session or Python-independent browser lifecycle. |
