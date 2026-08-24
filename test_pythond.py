@@ -38,9 +38,11 @@ def check(name, condition, detail=""):
     if condition:
         PASS += 1
     else:
-        print(f"  X {name}")
+        # sys.__stdout__: several tests mock sys.stdout, and a failure inside
+        # such a block must never be swallowed by the mock.
+        print(f"  X {name}", file=sys.__stdout__)
         if detail:
-            print(f"    {detail}")
+            print(f"    {detail}", file=sys.__stdout__)
         FAIL += 1
 
 
@@ -879,6 +881,32 @@ def test_client_exit_codes():
     check("run output printed", "42" in out.getvalue())
 
 
+def test_client_at_file():
+    section("client @file posts file contents")
+    src = "cfg = {'quotes': 'a \"b\" c'}\nlen(cfg)\n"
+    fd, path = tempfile.mkstemp(suffix=".py")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(src)
+        with mock.patch.object(pythond, "_request",
+                               return_value=(200, {}, "1")) as req, \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            pythond.client("run", ["work", f"@{path}"])
+        check("@file body is file contents",
+              req.call_args.args == ("POST", "/run/work", src), req.call_args)
+    finally:
+        os.unlink(path)
+    with mock.patch.object(pythond, "_request") as req, \
+         mock.patch.object(sys, "stderr", io.StringIO()) as err:
+        try:
+            pythond.client("run", ["work", "@/nonexistent/task.py"])
+            check("@missing file exits nonzero", False)
+        except SystemExit as e:
+            check("@missing file exits nonzero", e.code == 1, e.code)
+    check("@missing file fails before any request", not req.called)
+    check("@missing file error printed", "cannot read file" in err.getvalue())
+
+
 def test_format_int():
     section("_format_int rendering")
     check("threads only",
@@ -1235,6 +1263,7 @@ def main():
         test_attach_line_repl,
         test_attach_missing_session,
         test_client_exit_codes,
+        test_client_at_file,
         test_format_int,
         test_entry_points_exist,
         test_pysh_cli_smoke,

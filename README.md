@@ -58,6 +58,7 @@ Every `pysh` call is a fresh connection to the same live process.
 ```
 pysh new <name>              create session
 pysh run <name> "code"       sync exec → raw output
+pysh run <name> @task.py     post a file's contents as the cell (curl syntax)
 pysh fire <name> "code"      async thread → shares namespace, can't kill C
 pysh fork <name> "code"      async process (POSIX only) → killable, pickles vars back
 pysh poll <name> [cell_id]   check async result
@@ -234,9 +235,10 @@ Treat pythond like SSH into a Python runtime:
 
 - Import once; call shorter names in later cells.
 - The last expression auto-prints — no `print()` tax.
-- Complex code (quotes, f-strings, SQL): write a file, then
-  `exec(open('/tmp/task.py').read())`. The file is transport; the namespace
-  is the workspace.
+- Complex code (quotes, f-strings, SQL): write a file, then post it —
+  `pysh run work @/tmp/task.py` (or `curl --data-binary @task.py`). The file
+  is transport; the namespace is the workspace. `exec(open(...).read())`
+  inside a cell still covers files that live where the session runs.
 - Hot reload: `importlib.reload(m)` or `exec(open("module.py").read())`.
 - Host commands: `subprocess.run(..., capture_output=True, text=True)` from
   inside the session.

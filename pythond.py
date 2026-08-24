@@ -1336,9 +1336,19 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
                 text = _format_int(args[0], text)
         elif cmd in ("run", "fire", "fork"):
             if len(args) < 2:
-                print(f"ERR usage: {cmd} <name> <code>", file=sys.stderr)
+                print(f"ERR usage: {cmd} <name> <code|@file>", file=sys.stderr)
                 sys.exit(1)
             name, code = args[0], " ".join(args[1:])
+            if code.startswith("@"):
+                # curl convention: @file posts the file contents as the cell.
+                # The file is read client-side; exec(open(...)) inside a cell
+                # still covers files that live where the session runs.
+                try:
+                    with open(code[1:], encoding="utf-8") as f:
+                        code = f.read()
+                except OSError:
+                    print(f"ERR cannot read file: {code[1:]}", file=sys.stderr)
+                    sys.exit(1)
             status, hdrs, text = _request("POST", f"/{cmd}/{_quote(name)}", code)
             if (cmd == "run" and status == 200
                     and hdrs.get("X-Pythond-Exec-Error") == "1"):
@@ -1488,9 +1498,12 @@ def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
         ("fire", "async thread exec"),
         ("fork", "async process exec"),
     ):
-        p_cmd = sub.add_parser(cname, help=chelp)
+        p_cmd = sub.add_parser(cname, help=chelp,
+                               description="Code inline, or @file to post a "
+                                           "local file's contents as the cell.")
         p_cmd.add_argument("name")
-        p_cmd.add_argument("code", nargs=argparse.REMAINDER)
+        p_cmd.add_argument("code", nargs=argparse.REMAINDER,
+                           metavar="code|@file")
     p_poll = sub.add_parser("poll", help="check async result")
     p_poll.add_argument("name")
     p_poll.add_argument("cell_id", nargs="?")

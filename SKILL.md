@@ -145,7 +145,7 @@ pysh run work "db.execute('SELECT count(*) FROM users').fetchone()"
 ## File Loading
 
 For code with quotes, f-strings, SQL, or more than a small expression, write a
-file and load it into the session:
+file and post it as the cell (curl's `@file` syntax):
 
 ```bash
 cat > /tmp/pythond_task.py << 'EOF'
@@ -153,10 +153,14 @@ import pandas as pd
 df = pd.read_csv("data.csv")
 print(f"rows={len(df)} cols={list(df.columns)}")
 EOF
-pysh run work "exec(open('/tmp/pythond_task.py').read())"
+pysh run work @/tmp/pythond_task.py
 ```
 
 The file is transport. The namespace is the workspace.
+
+`@file` reads the file on the client. When the file lives where the session
+runs (e.g. a remote daemon reached over ssh), load it inside a cell instead:
+`pysh run work "exec(open('/path/on/server.py').read())"`.
 
 ## Output Formats
 
