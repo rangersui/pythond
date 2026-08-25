@@ -82,6 +82,7 @@ pysh ls                      # list sessions
 pysh status <name>           # JSON health
 pysh vars <name>             # JSON namespace names
 pysh complete <name> "text"  # JSON completion candidates
+pysh cp <src> <dst>          # copy pickled objects (scp syntax)
 ```
 
 Session names are canonical lowercase: `a-z`, `0-9`, `_`, or `-`, 1-80
@@ -161,6 +162,23 @@ The file is transport. The namespace is the workspace.
 `@file` reads the file on the client. When the file lives where the session
 runs (e.g. a remote daemon reached over ssh), load it inside a cell instead:
 `pysh run work "exec(open('/path/on/server.py').read())"`.
+
+## Moving Objects (cp)
+
+`run` moves source; `pysh cp` moves live objects as pickles, scp syntax.
+A side is `session:var`, `session:` (whole picklable namespace), or a file:
+
+```bash
+pysh cp work:df df.pkl          # checkpoint one object to disk
+pysh cp df.pkl gpu:df           # inject it into another session
+pysh cp work:model gpu:model    # session -> session, no temp file
+pysh cp work: backup:           # clone the picklable namespace
+```
+
+Use it to move parsed data between sessions instead of re-parsing, or to
+checkpoint expensive objects across daemon restarts. Unpicklable values
+(sockets, locks, modules) are skipped with a warning — reopen those in the
+destination session.
 
 ## Output Formats
 

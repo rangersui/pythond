@@ -69,6 +69,7 @@ pysh status <name>           session health (JSON)
 pysh vars <name>             namespace names (JSON)
 pysh complete <name> "text"  tab completion (JSON)
 pysh attach <name>           line REPL into the session (Ctrl-D detaches)
+pysh cp <src> <dst>          copy pickled objects (scp syntax, see below)
 
 pyctl start [--show-token]   start daemon in foreground
 pyctl stop                   stop daemon
@@ -136,12 +137,39 @@ GET  /status/<name>           JSON health
 GET  /vars/<name>             JSON namespace names
 POST /complete/<name> body    JSON completion matches
 POST /int/<name>              JSON interrupt report
+GET  /pickle/<name>[/<var>]   pickled var (or whole picklable namespace dict)
+POST /pickle/<name>[/<var>]   unpickle body into var (or merge a pickled dict)
 POST /kill/<name>             kill session
 POST /stop                    stop daemon
 ```
 
 `404` no such session, `409` session channel broken, `401` bad token.
 Python source goes in the request body, raw — never JSON-escaped.
+
+## Objects move as pickles
+
+`run` moves source code; `/pickle` moves live objects. It is the fork
+merge-back mechanism, generalized into an import/export surface — and POSTing
+a pickle is arbitrary code loading by design, the same trust boundary as
+`/run`.
+
+`pysh cp` gives it scp syntax. A side is `session:var`, `session:` (the whole
+picklable namespace), or a file path:
+
+```bash
+pysh cp work:df df.pkl          # session -> file
+pysh cp df.pkl gpu:df           # file -> session
+pysh cp work:model gpu:model    # session -> session
+pysh cp work: backup:           # clone the picklable namespace
+```
+
+Unpicklable values (sockets, locks, modules) are skipped and reported
+(`X-Pythond-Skipped` header; `pysh cp` prints a warning). Or speak it raw:
+
+```bash
+curl --unix-socket ... http://pythond/pickle/work/df -o df.pkl
+curl --unix-socket ... --data-binary @df.pkl http://pythond/pickle/gpu/df
+```
 
 ## Remote = ssh
 

@@ -655,25 +655,29 @@ def test_send_session_dead_worker():
           "no session" in pythond.send_session("__nope__", "status", [])["error"])
 
 
+def _cmd(method, cmd, name="", var="", query=None, body=b""):
+    return pythond._daemon_command(method, cmd, name, var, query or {}, body)
+
+
 def test_daemon_command_routing():
     section("_daemon_command routing")
-    status, _h, text = pythond._daemon_command("GET", "ls", "", {}, "")
+    status, _h, text = _cmd("GET", "ls")
     check("ls routes", status == 200)
-    status, _h, text = pythond._daemon_command("GET", "bogus", "", {}, "")
+    status, _h, text = _cmd("GET", "bogus")
     check("unknown route 404", status == 404 and "ERR unknown" in text, text)
-    status, _h, text = pythond._daemon_command("POST", "run", "Bad.Name", {}, "x")
+    status, _h, text = _cmd("POST", "run", "Bad.Name", body=b"x")
     check("invalid name 400", status == 400 and "invalid session name" in text)
-    status, _h, text = pythond._daemon_command("GET", "run", "work", {}, "")
+    status, _h, text = _cmd("GET", "run", "work")
     check("run via GET 405", status == 405, text)
-    status, _h, text = pythond._daemon_command("GET", "int", "work", {}, "")
+    status, _h, text = _cmd("GET", "int", "work")
     check("int via GET 405", status == 405, text)
     with mock.patch.object(pythond, "send_session",
                            return_value={"error": "no session 'work' -- create it first: new work"}):
-        status, _h, text = pythond._daemon_command("POST", "run", "work", {}, "1")
+        status, _h, text = _cmd("POST", "run", "work", body=b"1")
         check("missing session 404", status == 404 and text.startswith("ERR"), text)
     with mock.patch.object(pythond, "send_session",
                            return_value={"error": "timeout -- command channel may be out of sync"}):
-        status, _h, text = pythond._daemon_command("POST", "run", "work", {}, "1")
+        status, _h, text = _cmd("POST", "run", "work", body=b"1")
         check("broken channel 409", status == 409, text)
 
 
@@ -682,7 +686,7 @@ def test_daemon_command_run_exec_error_header():
     with mock.patch.object(pythond, "send_session",
                            return_value={"output": "Traceback...", "_error": True}), \
          mock.patch.object(pythond, "_log_history") as log:
-        status, hdrs, text = pythond._daemon_command("POST", "run", "work", {}, "1/0")
+        status, hdrs, text = _cmd("POST", "run", "work", body=b"1/0")
     check("exec error still 200", status == 200)
     check("exec error header set", hdrs.get("X-Pythond-Exec-Error") == "1")
     check("exec error body is output", text == "Traceback...")
@@ -690,7 +694,7 @@ def test_daemon_command_run_exec_error_header():
     with mock.patch.object(pythond, "send_session",
                            return_value={"output": "4", "_error": False}), \
          mock.patch.object(pythond, "_log_history") as log:
-        status, hdrs, text = pythond._daemon_command("POST", "run", "work", {}, "2+2")
+        status, hdrs, text = _cmd("POST", "run", "work", body=b"2+2")
     check("run success 200", status == 200 and text == "4")
     check("no error header on success", "X-Pythond-Exec-Error" not in hdrs)
     check("success checkpointed", log.call_args.args == ("work", "2+2"))
@@ -703,20 +707,177 @@ def test_daemon_command_async_history():
     with _with_session(name, s):
         with mock.patch.object(pythond, "send_session",
                                return_value={"cell_id": "abc", "status": "fired"}):
-            status, _h, text = pythond._daemon_command(
-                "POST", "fire", name, {}, "a = 1")
+            status, _h, text = _cmd("POST", "fire", name, body=b"a = 1")
         check("fire 200", status == 200)
         check("async src retained", s["async_src"].get("abc") == "a = 1")
         with mock.patch.object(pythond, "send_session",
                                return_value={"cell_id": "abc", "status": "done",
                                              "output": "", "_error": False}), \
              mock.patch.object(pythond, "_log_history") as log:
-            status, _h, text = pythond._daemon_command(
-                "GET", "poll", name, {"cell": ["abc"]}, "")
+            status, _h, text = _cmd("GET", "poll", name,
+                                    query={"cell": ["abc"]})
         check("poll done 200", status == 200)
         check("poll checkpoints async src", log.call_args.args == (name, "a = 1"))
         check("async src popped", "abc" not in s["async_src"])
     pythond.sessions.pop(name, None)
+
+
+def test_dispatch_dump_load():
+    section("_dispatch dump/load (pickle in/out)")
+    import base64
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    _exec = pythond._make_exec(ns, lock)
+    cells = {}
+    ns["df"] = {"rows": 100}
+    ns["lk"] = threading.Lock()
+
+    resp = pythond._dispatch("dump", ["df"], _exec, cells, ns, lock)
+    check("dump var has pickle", "pickle" in resp, resp)
+    import pickle as _p
+    check("dump var roundtrips",
+          _p.loads(base64.b64decode(resp["pickle"])) == {"rows": 100})
+
+    resp = pythond._dispatch("dump", ["missing"], _exec, cells, ns, lock)
+    check("dump missing var errors", "is not defined" in resp.get("error", ""))
+    resp = pythond._dispatch("dump", ["lk"], _exec, cells, ns, lock)
+    check("dump unpicklable var errors", "not picklable" in resp.get("error", ""))
+
+    resp = pythond._dispatch("dump", [""], _exec, cells, ns, lock)
+    whole = _p.loads(base64.b64decode(resp["pickle"]))
+    check("whole dump includes df", whole.get("df") == {"rows": 100})
+    check("whole dump skips lock", "lk" in resp.get("skipped", []), resp)
+    check("whole dump skips modules", "os" in resp.get("skipped", []), resp)
+    check("whole dump excludes skipped from payload", "lk" not in whole)
+
+    b64 = base64.b64encode(_p.dumps([1, 2, 3])).decode()
+    resp = pythond._dispatch("load", ["items", b64], _exec, cells, ns, lock)
+    check("load sets var", resp == {"set": ["items"]}, resp)
+    check("loaded var live", ns.get("items") == [1, 2, 3])
+
+    b64 = base64.b64encode(_p.dumps({"a": 1, "_hidden": 2})).decode()
+    resp = pythond._dispatch("load", ["", b64], _exec, cells, ns, lock)
+    check("whole load merges dict", resp == {"set": ["a"]}, resp)
+    check("whole load sets a", ns.get("a") == 1)
+    check("whole load skips underscore keys", "_hidden" not in ns)
+
+    b64 = base64.b64encode(_p.dumps([1])).decode()
+    resp = pythond._dispatch("load", ["", b64], _exec, cells, ns, lock)
+    check("whole load rejects non-dict", "needs a pickled dict" in resp["error"])
+    resp = pythond._dispatch("load", ["x", "not-base64-pickle"], _exec, cells, ns, lock)
+    check("bad payload errors", "unpickle failed" in resp.get("error", ""))
+    resp = pythond._dispatch("load", ["x"], _exec, cells, ns, lock)
+    check("load without data errors", "requires pickled data" in resp.get("error", ""))
+
+
+def test_daemon_command_pickle_route():
+    section("_daemon_command /pickle route")
+    import base64, pickle as _p
+    payload = base64.b64encode(_p.dumps(42)).decode()
+    with mock.patch.object(pythond, "send_session",
+                           return_value={"pickle": payload, "skipped": []}) as ss:
+        status, hdrs, body = _cmd("GET", "pickle", "work", "x")
+    check("pickle GET 200", status == 200)
+    check("pickle GET raw bytes", body == _p.dumps(42), body)
+    check("pickle GET content type",
+          hdrs.get("Content-Type") == "application/octet-stream")
+    check("pickle GET sends dump", ss.call_args.args == ("work", "dump", ["x"]))
+
+    with mock.patch.object(pythond, "send_session",
+                           return_value={"pickle": payload,
+                                         "skipped": ["os", "lk"]}):
+        status, hdrs, body = _cmd("GET", "pickle", "work")
+    check("skipped surfaces in header",
+          hdrs.get("X-Pythond-Skipped") == "os,lk", hdrs)
+
+    with mock.patch.object(pythond, "send_session",
+                           return_value={"set": ["x"]}) as ss:
+        status, _h, text = _cmd("POST", "pickle", "work", "x",
+                                body=_p.dumps(42))
+    check("pickle POST 200", status == 200 and text == "OK set x", text)
+    check("pickle POST sends load b64",
+          ss.call_args.args == ("work", "load",
+                                ["x", base64.b64encode(_p.dumps(42)).decode()]))
+
+    with mock.patch.object(pythond, "send_session",
+                           return_value={"error": "name 'x' is not defined"}):
+        status, _h, text = _cmd("GET", "pickle", "work", "x")
+    check("missing var 404", status == 404, text)
+    status, _h, text = _cmd("GET", "pickle", "work", "not a var!")
+    check("invalid var name 400", status == 400, text)
+
+
+def test_parse_cp_target():
+    section("_parse_cp_target (scp syntax)")
+    check("session:var", pythond._parse_cp_target("work:df") ==
+          ("session", "work", "df"))
+    check("session: whole", pythond._parse_cp_target("work:") ==
+          ("session", "work", ""))
+    check("plain file", pythond._parse_cp_target("df.pkl") ==
+          ("file", "df.pkl", ""))
+    check("windows drive path is a file",
+          pythond._parse_cp_target("C:\\tmp\\df.pkl") ==
+          ("file", "C:\\tmp\\df.pkl", ""))
+    check("unix path is a file",
+          pythond._parse_cp_target("/tmp/df.pkl") == ("file", "/tmp/df.pkl", ""))
+    try:
+        pythond._parse_cp_target("Bad.Name:x")
+        check("invalid session name rejected", False)
+    except ValueError:
+        check("invalid session name rejected", True)
+    try:
+        pythond._parse_cp_target("work:not a var")
+        check("invalid var rejected", False)
+    except ValueError:
+        check("invalid var rejected", True)
+
+
+def test_client_cp():
+    section("client cp")
+    import pickle as _p
+    raw = _p.dumps({"n": 7})
+    calls = []
+    def fake_request_bytes(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            return 200, {}, raw
+        return 200, {}, b"OK set df"
+    with mock.patch.object(pythond, "_request_bytes",
+                           side_effect=fake_request_bytes), \
+         mock.patch.object(sys, "stdout", io.StringIO()) as out:
+        pythond.client("cp", ["a:df", "b:df"])
+    check("cp session->session GET then POST",
+          calls == [("GET", "/pickle/a/df", None),
+                    ("POST", "/pickle/b/df", raw)], calls)
+    check("cp prints result", "OK set df" in out.getvalue())
+
+    fd, path = tempfile.mkstemp(suffix=".pkl")
+    os.close(fd)
+    try:
+        calls.clear()
+        with mock.patch.object(pythond, "_request_bytes",
+                               side_effect=fake_request_bytes), \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            pythond.client("cp", ["a:df", path])
+        check("cp session->file wrote pickle",
+              open(path, "rb").read() == raw)
+        calls.clear()
+        with mock.patch.object(pythond, "_request_bytes",
+                               side_effect=fake_request_bytes), \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            pythond.client("cp", [path, "b:df"])
+        check("cp file->session posts bytes",
+              calls == [("POST", "/pickle/b/df", raw)], calls)
+    finally:
+        os.unlink(path)
+
+    with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+        try:
+            pythond.client("cp", ["a.pkl", "b.pkl"])
+            check("cp file->file rejected", False)
+        except SystemExit as e:
+            check("cp file->file rejected", e.code == 1)
+    check("cp file->file hint", "shell's cp" in err.getvalue())
 
 
 def test_worker_subprocess_protocol():
@@ -1188,6 +1349,46 @@ def test_integration_second_daemon_fails():
             pythond._request("POST", "/stop")
 
 
+def test_integration_pickle_cp():
+    section("INTEGRATION: pickle endpoints + cp")
+    import pickle as _p
+    a, b = "__it_pk_a__", "__it_pk_b__"
+    with tempfile.TemporaryDirectory() as td, _Daemon(td):
+        pythond._request("POST", f"/new/{a}")
+        pythond._request("POST", f"/new/{b}")
+        pythond._request("POST", f"/run/{a}", "df = {'rows': 100}")
+
+        status, hdrs, raw = pythond._request_bytes("GET", f"/pickle/{a}/df")
+        check("GET pickle 200", status == 200)
+        check("GET pickle roundtrips", _p.loads(raw) == {"rows": 100})
+
+        status, _h, out = pythond._request_bytes("POST", f"/pickle/{b}/df2", raw)
+        check("POST pickle 200", status == 200, out)
+        _s, _h, text = pythond._request("POST", f"/run/{b}", "df2['rows'] + 1")
+        check("posted object live in other session", text.strip() == "101", text)
+
+        status, hdrs, raw = pythond._request_bytes("GET", f"/pickle/{a}")
+        check("whole-namespace GET 200", status == 200)
+        check("whole-namespace skips modules",
+              "os" in hdrs.get("X-Pythond-Skipped", ""), hdrs)
+        check("whole-namespace has df", _p.loads(raw).get("df") == {"rows": 100})
+
+        pkl = os.path.join(td, "df.pkl")
+        with mock.patch.object(sys, "stdout", io.StringIO()), \
+             mock.patch.object(sys, "stderr", io.StringIO()):
+            pythond.client("cp", [f"{a}:df", pkl])
+            pythond.client("cp", [pkl, f"{b}:df3"])
+        _s, _h, text = pythond._request("POST", f"/run/{b}", "df3 == df2")
+        check("cp via file roundtrips", text.strip() == "True", text)
+
+        status, _h, text = pythond._request("GET", f"/pickle/{a}/nope")
+        check("missing var 404", status == 404, text)
+        pythond._request("POST", "/stop")
+    for name in (a, b):
+        shutil.rmtree(os.path.join(os.path.expanduser("~"), ".pythond",
+                                   "sessions", name), ignore_errors=True)
+
+
 def test_integration_fork():
     section("INTEGRATION: fork over HTTP")
     if sys.platform == "win32":
@@ -1257,6 +1458,10 @@ def main():
         test_daemon_command_routing,
         test_daemon_command_run_exec_error_header,
         test_daemon_command_async_history,
+        test_dispatch_dump_load,
+        test_daemon_command_pickle_route,
+        test_parse_cp_target,
+        test_client_cp,
         test_worker_subprocess_protocol,
         test_worker_entry_requires_env,
         test_needs_more,
@@ -1273,6 +1478,7 @@ def main():
         test_integration_crash_isolation,
         test_integration_auth,
         test_integration_second_daemon_fails,
+        test_integration_pickle_cp,
         test_integration_fork,
     ]
     registered = {fn.__name__ for fn in tests}

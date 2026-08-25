@@ -153,12 +153,32 @@ GET  /status/&lt;name&gt;           JSON health
 GET  /vars/&lt;name&gt;             JSON namespace names
 POST /complete/&lt;name&gt; body    JSON completion matches
 POST /int/&lt;name&gt;              JSON interrupt report
+GET  /pickle/&lt;name&gt;[/&lt;var&gt;]   pickled var (or whole picklable namespace)
+POST /pickle/&lt;name&gt;[/&lt;var&gt;]   unpickle body into var (or merge a dict)
 POST /kill/&lt;name&gt;             kill session
 POST /stop                    stop daemon
 </pre>
 
 <p><code>404</code> no such session, <code>409</code> session channel broken,
 <code>401</code> bad token.</p>
+
+<h2>Objects move as pickles</h2>
+
+<p><code>run</code> moves source code; <code>/pickle</code> moves live
+objects &mdash; the fork merge-back mechanism, generalized. <code>pysh cp</code>
+gives it scp syntax: a side is <code>session:var</code>, <code>session:</code>
+(the whole picklable namespace), or a file path.</p>
+
+<pre>
+pysh cp work:df df.pkl          # session -&gt; file
+pysh cp df.pkl gpu:df           # file -&gt; session
+pysh cp work:model gpu:model    # session -&gt; session
+pysh cp work: backup:           # clone the picklable namespace
+</pre>
+
+<p>Unpicklable values (sockets, locks, modules) are skipped and reported.
+POSTing a pickle is arbitrary code loading by design &mdash; the same trust
+boundary as <code>/run</code>.</p>
 
 <h2>Attach</h2>
 
@@ -183,6 +203,7 @@ pysh status &lt;name&gt;           JSON health
 pysh vars &lt;name&gt;             JSON namespace names
 pysh complete &lt;name&gt; "text"  JSON completion candidates
 pysh attach &lt;name&gt;           line REPL (Ctrl-D to detach)
+pysh cp &lt;src&gt; &lt;dst&gt;          copy pickled objects (scp syntax)
 
 pyctl start [--show-token]   start daemon in foreground
 pyctl stop                   stop daemon

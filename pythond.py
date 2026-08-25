@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile
 import argparse
+import base64
 import codeop
 import contextlib
 import ctypes
@@ -781,6 +782,56 @@ def _dispatch(
                 "running": running, "vars": vs, "cells": ncells}
     elif cmd == "vars":
         return {"vars": _public_names(ns, lock)}
+    elif cmd == "dump":
+        # Pickle one variable -- or the whole picklable namespace -- out of
+        # the session.  Same per-var probe as the fork merge: unpicklable
+        # values (sockets, locks, modules) are skipped and reported.
+        var = args[0] if args else ""
+        with _locked(lock):
+            if var:
+                if var not in ns:
+                    return {"error": f"name '{var}' is not defined"}
+                try:
+                    payload = pickle.dumps(ns[var])
+                except Exception as e:
+                    return {"error": f"'{var}' is not picklable: "
+                                     f"{e.__class__.__name__}"}
+                skipped: list[str] = []
+            else:
+                data = {}
+                skipped = []
+                for k, v in ns.items():
+                    if k.startswith("_"):
+                        continue
+                    try:
+                        pickle.dumps(v)
+                        data[k] = v
+                    except Exception:
+                        skipped.append(k)
+                payload = pickle.dumps(data)
+        return {"pickle": base64.b64encode(payload).decode("ascii"),
+                "skipped": skipped}
+    elif cmd == "load":
+        # Unpickle into the session: one variable, or merge a pickled dict
+        # into the namespace.  Trust boundary: an authenticated client can
+        # already exec arbitrary code; pickle adds no new capability.
+        var = args[0] if args else ""
+        if len(args) < 2:
+            return {"error": "load requires pickled data"}
+        try:
+            obj = pickle.loads(base64.b64decode(args[1]))
+        except Exception as e:
+            return {"error": f"unpickle failed: {e.__class__.__name__}"}
+        with _locked(lock):
+            if var:
+                ns[var] = obj
+                return {"set": [var]}
+            if not isinstance(obj, dict):
+                return {"error": "whole-session load needs a pickled dict"}
+            names = sorted(k for k in obj
+                           if isinstance(k, str) and not k.startswith("_"))
+            ns.update({k: obj[k] for k in names})
+            return {"set": names}
     elif cmd == "complete":
         import rlcompleter
         text = args[0] if args else ""
@@ -1036,12 +1087,21 @@ def _note_async_poll(name: str, resp: JsonDict, exec_error: bool) -> None:
 
 _SESSION_CMDS = {"run", "fire", "fork", "poll", "int",
                  "status", "vars", "complete"}
+_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _daemon_command(method: str, cmd: str, name: str, query: dict[str, list[str]],
-                    body: str) -> tuple[int, dict[str, str], str]:
-    """Execute one HTTP command.  Returns (status, extra_headers, body_text)."""
+def _session_error_status(msg: str) -> int:
+    if msg.startswith("no session") or "is not defined" in msg:
+        return 404
+    return 409
+
+
+def _daemon_command(method: str, cmd: str, name: str, var: str,
+                    query: dict[str, list[str]],
+                    body_bytes: bytes) -> tuple[int, dict[str, str], str | bytes]:
+    """Execute one HTTP command.  Returns (status, extra_headers, body)."""
     headers: dict[str, str] = {}
+    body = body_bytes.decode("utf-8", "replace")
     if cmd == "ls" and method == "GET":
         return 200, headers, _list_sessions()
     if cmd == "stop" and method == "POST":
@@ -1068,6 +1128,29 @@ def _daemon_command(method: str, cmd: str, name: str, query: dict[str, list[str]
         if kill_session(name):
             return 200, headers, f"OK killed {name}"
         return 404, headers, f"ERR no session '{name}'"
+    if cmd == "pickle":
+        # GET  /pickle/<name>[/<var>] -> pickled var (or picklable namespace dict)
+        # POST /pickle/<name>[/<var>] -> unpickle body into var (or merge dict)
+        # POST is arbitrary code loading by design -- same trust boundary as
+        # /run; the whole mechanism is fork's merge-back, generalized.
+        if var and not _VAR_NAME_RE.fullmatch(var):
+            return 400, headers, "ERR invalid variable name"
+        if method == "GET":
+            resp = send_session(name, "dump", [var])
+            if "error" in resp:
+                msg = str(resp["error"])
+                return _session_error_status(msg), headers, f"ERR {msg}"
+            if resp.get("skipped"):
+                headers["X-Pythond-Skipped"] = ",".join(resp["skipped"])
+            headers["Content-Type"] = "application/octet-stream"
+            return 200, headers, base64.b64decode(resp["pickle"])
+        resp = send_session(
+            name, "load",
+            [var, base64.b64encode(body_bytes).decode("ascii")])
+        if "error" in resp:
+            msg = str(resp["error"])
+            return _session_error_status(msg), headers, f"ERR {msg}"
+        return 200, headers, "OK set " + " ".join(resp.get("set", []))
     if cmd not in _SESSION_CMDS:
         return 404, headers, f"ERR unknown: {cmd}"
     if (cmd in ("run", "fire", "fork", "complete", "int")) != (method == "POST"):
@@ -1084,8 +1167,7 @@ def _daemon_command(method: str, cmd: str, name: str, query: dict[str, list[str]
 
     if "error" in resp and "_error" not in resp:
         msg = str(resp["error"])
-        status = 404 if msg.startswith("no session") else 409
-        return status, headers, f"ERR {msg}"
+        return _session_error_status(msg), headers, f"ERR {msg}"
 
     exec_error = bool(resp.pop("_error", False))
     if cmd == "run":
@@ -1119,14 +1201,15 @@ class _Handler(BaseHTTPRequestHandler):
         # One line per request to daemon stderr; never code bodies.
         print(f"ACCESS {self.address_string()} {fmt % args}", file=sys.stderr)
 
-    def _reply(self, status: int, body: str,
-               extra: dict[str, str] | None = None,
-               content_type: str = "text/plain; charset=utf-8") -> None:
-        payload = body.encode("utf-8")
+    def _reply(self, status: int, body: str | bytes,
+               extra: dict[str, str] | None = None) -> None:
+        payload = body.encode("utf-8") if isinstance(body, str) else body
+        extra = dict(extra or {})
+        content_type = extra.pop("Content-Type", "text/plain; charset=utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
-        for k, v in (extra or {}).items():
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         with contextlib.suppress(OSError):
@@ -1147,8 +1230,9 @@ class _Handler(BaseHTTPRequestHandler):
         parts = [p for p in parsed.path.split("/") if p]
         cmd = parts[0] if parts else ""
         name = parts[1] if len(parts) > 1 else ""
+        var = parts[2] if len(parts) > 2 else ""
         query = urllib.parse.parse_qs(parsed.query)
-        body = ""
+        body = b""
         if method == "POST":
             if self.headers.get("Transfer-Encoding"):
                 self._reply(411, "ERR chunked bodies not supported")
@@ -1157,9 +1241,10 @@ class _Handler(BaseHTTPRequestHandler):
             if length > _MAX_BODY:
                 self._reply(413, "ERR body too large")
                 return
-            body = self.rfile.read(length).decode("utf-8", "replace")
+            body = self.rfile.read(length)
         try:
-            status, extra, text = _daemon_command(method, cmd, name, query, body)
+            status, extra, text = _daemon_command(method, cmd, name, var,
+                                                  query, body)
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._reply(500, "ERR internal error", {"Connection": "close"})
@@ -1299,23 +1384,28 @@ def _connect() -> tuple[http.client.HTTPConnection, str | None]:
             token or meta.get("token"))
 
 
-def _request(method: str, path: str,
-             body: str | None = None) -> tuple[int, dict[str, str], str]:
+def _request_bytes(method: str, path: str,
+                   body: bytes | None = None) -> tuple[int, dict[str, str], bytes]:
     """One HTTP request to the daemon.  Raises OSError-family on no daemon."""
     conn, token = _connect()
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        conn.request(method, path,
-                     body=body.encode("utf-8") if body is not None else None,
-                     headers=headers)
+        conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
-        text = resp.read().decode("utf-8", "replace")
-        return resp.status, dict(resp.getheaders()), text
+        return resp.status, dict(resp.getheaders()), resp.read()
     finally:
         with contextlib.suppress(Exception):
             conn.close()
+
+
+def _request(method: str, path: str,
+             body: str | None = None) -> tuple[int, dict[str, str], str]:
+    """_request_bytes for text commands."""
+    status, headers, raw = _request_bytes(
+        method, path, body.encode("utf-8") if body is not None else None)
+    return status, headers, raw.decode("utf-8", "replace")
 
 
 def _quote(name: str) -> str:
@@ -1373,6 +1463,13 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
                 sys.exit(1)
             status, _h, text = _request("POST", f"/complete/{_quote(args[0])}",
                                         args[1])
+        elif cmd == "cp":
+            if len(args) != 2:
+                print("ERR usage: cp <session:var|session:|file> "
+                      "<session:var|session:|file>", file=sys.stderr)
+                sys.exit(1)
+            _cp(args[0], args[1])
+            return
         elif cmd == "stop":
             status, _h, text = _request("POST", "/stop")
         else:
@@ -1386,6 +1483,68 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
         print(text, file=sys.stderr if status >= 400 else sys.stdout)
     if status >= 400 and fail_on_err:
         sys.exit(1)
+
+
+def _parse_cp_target(arg: str) -> tuple[str, str, str]:
+    """Parse one `pysh cp` side: ('session', name, var) or ('file', path, '').
+
+    scp syntax: `work:df` is variable df in session work, `work:` is the whole
+    picklable namespace.  A Windows drive prefix (C:\\...) or a colon-free
+    string is a file path.
+    """
+    if re.match(r"^[A-Za-z]:[\\/]", arg) or ":" not in arg:
+        return ("file", arg, "")
+    name, _, var = arg.partition(":")
+    _validate_session_name(name)
+    if var and not _VAR_NAME_RE.fullmatch(var):
+        raise ValueError(f"invalid variable name: {var}")
+    return ("session", name, var)
+
+
+def _cp(src: str, dst: str) -> None:
+    """pysh cp: move pickled objects between sessions and files."""
+    try:
+        src_kind, src_a, src_b = _parse_cp_target(src)
+        dst_kind, dst_a, dst_b = _parse_cp_target(dst)
+    except ValueError as e:
+        print(f"ERR {e}", file=sys.stderr)
+        sys.exit(1)
+    if src_kind == "file" and dst_kind == "file":
+        print("ERR both sides are files -- use your shell's cp", file=sys.stderr)
+        sys.exit(1)
+
+    if src_kind == "session":
+        status, hdrs, raw = _request_bytes(
+            "GET", f"/pickle/{_quote(src_a)}/{_quote(src_b)}".rstrip("/"))
+        if status != 200:
+            print(raw.decode("utf-8", "replace"), file=sys.stderr)
+            sys.exit(1)
+        skipped = hdrs.get("X-Pythond-Skipped", "")
+        if skipped:
+            print(f"WARN: not picklable, skipped: {skipped}", file=sys.stderr)
+    else:
+        try:
+            with open(src_a, "rb") as f:
+                raw = f.read()
+        except OSError:
+            print(f"ERR cannot read file: {src_a}", file=sys.stderr)
+            sys.exit(1)
+
+    if dst_kind == "session":
+        status, _h, out = _request_bytes(
+            "POST", f"/pickle/{_quote(dst_a)}/{_quote(dst_b)}".rstrip("/"), raw)
+        text = out.decode("utf-8", "replace")
+        print(text, file=sys.stderr if status != 200 else sys.stdout)
+        if status != 200:
+            sys.exit(1)
+    else:
+        try:
+            with open(dst_a, "wb") as f:
+                f.write(raw)
+        except OSError:
+            print(f"ERR cannot write file: {dst_a}", file=sys.stderr)
+            sys.exit(1)
+        print(f"OK wrote {dst_a} ({len(raw)} bytes)")
 
 
 def _format_int(name: str, text: str) -> str:
@@ -1519,6 +1678,13 @@ def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
     p_complete = sub.add_parser("complete", help="tab completions")
     p_complete.add_argument("name")
     p_complete.add_argument("text")
+    p_cp = sub.add_parser(
+        "cp", help="copy pickled objects (scp syntax)",
+        description="Sides are session:var, session: (whole picklable "
+                    "namespace), or a file path.  Examples: "
+                    "cp work:df df.pkl / cp df.pkl gpu:df / cp work: other:")
+    p_cp.add_argument("src")
+    p_cp.add_argument("dst")
 
 
 def _run_session_command(args: argparse.Namespace, argv: list[str]) -> None:
