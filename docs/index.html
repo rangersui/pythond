@@ -18,14 +18,13 @@ hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }
 
 <h1>pythond</h1>
 
-<p><b>sshd gives you a shell. pythond gives you Python.</b></p>
+<p><b>Persistent Python sessions. Code in, result out.</b></p>
 
-<p>Persistent Python daemon with named sessions. Code in, result out.
-Variables, connections, and threads survive between calls.
-Agents send code through WebSocket. Humans attach with a real terminal.
+<p>Variables, connections, and threads survive between calls.
+Agents send code through one-shot commands. Humans attach a REPL.
 Same namespace.</p>
 
-<pre>pip install pythond</pre>
+<pre>pip install pythond        # zero dependencies</pre>
 
 <p>Python 3.10+. Three entry points:</p>
 
@@ -36,10 +35,26 @@ Same namespace.</p>
 <tr><td><code>pyctl</code></td><td>daemon control</td><td>systemctl</td></tr>
 </table>
 
+<h2>The whole idea</h2>
+
+<pre>
+ns = {}
+while True:
+    code = receive()
+    exec(code, ns)         # ns stays alive -- variables survive
+    send(captured_stdout)
+</pre>
+
+<p>Everything pythond adds is that loop plus delivery: thread-safe stdout
+capture, REPL semantics (the last expression auto-prints), one subprocess per
+named session, async cells, and local HTTP so one-shot CLI calls reach the
+live process. Transport is borrowed, never built &mdash; there is no WebSocket
+stack, no TLS stack, no PTY bridge, and no remote proxy in the codebase.</p>
+
 <h2>Quick start</h2>
 
 <pre>
-pyctl start
+pythond daemon
 pysh new work
 pysh run work "x = 42"
 pysh run work "x + 1"
@@ -58,7 +73,8 @@ pysh run work "db.execute('SELECT count(*) FROM users').fetchone()"
 # (42,)
 </pre>
 
-<p>The connection never closed. The namespace is the workspace.</p>
+<p>Connection &ne; state. Every call is a fresh connection to the same live
+process. The namespace is the workspace.</p>
 
 <h2>Async execution</h2>
 
@@ -74,53 +90,11 @@ pysh fork work "results = expensive_search(params)"
 pysh int work                              # SIGKILL the fork (POSIX)
 </pre>
 
-<h2>Remote</h2>
+<h2>Post a file</h2>
 
-<p>AI agents can't hold SSH sessions open. The local daemon holds
-the connection the agent can't hold.</p>
-
-<pre>
-# server
-pip install pythond
-pyctl start --listen 0.0.0.0:7984 --show-token
-# Non-loopback --listen auto-enables TLS
-# prints token and cert fingerprint
-
-# client: self-signed server cert must be pinned before connecting
-# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
-pyctl pin ~/server_cert.pem
-pythond daemon
-pyctl connect work 10.0.0.5:7984 &lt;token&gt; --tls
-pysh run work "import platform; platform.node()"
-# remote-host-01
-</pre>
-
-<h3>mTLS plus token</h3>
-
-<pre>
-# client: generate client cert
-pyctl cert
-# copy client ~/.pythond/tls/cert.pem to server as ~/client_cert.pem
-
-# server: generate server cert, then trust client cert
-pyctl cert
-# copy server ~/.pythond/tls/cert.pem to client as ~/server_cert.pem
-pyctl trust ~/client_cert.pem
-pyctl start --listen 0.0.0.0:7984 --show-token
-# Non-loopback --listen auto-enables TLS
-# cert is required and token is still required
-
-# client: pin server cert, then connect (client cert sent automatically)
-pyctl pin ~/server_cert.pem
-pythond daemon
-pyctl connect work 10.0.0.5:7984 &lt;token&gt; --tls
-pysh run work "x"
-</pre>
-
-<h2>Write file, then exec</h2>
-
-<p>Complex code with quotes, f-strings, or SQL? Write a file, load it.
-No escaping.</p>
+<p>Complex code with quotes, f-strings, or SQL? Post the file as the cell.
+The request body is raw Python source &mdash; never JSON-escaped, never
+shell-quoted.</p>
 
 <pre>
 cat &gt; /tmp/task.py &lt;&lt; 'EOF'
@@ -129,40 +103,76 @@ df = pd.read_csv("data.csv")
 print(f"rows: {len(df)}, cols: {list(df.columns)}")
 EOF
 
-pysh run work "exec(open('/tmp/task.py').read())"
+pysh run work @/tmp/task.py
 </pre>
 
-<h2>Two channels, one namespace</h2>
+<h2>Remote = ssh</h2>
+
+<p>State lives in the remote daemon, not in the connection, so one-shot
+calls over ssh are enough:</p>
 
 <pre>
-Agent channel (pysh run):       Human channel (pysh attach):
-  code in, text out               POSIX PTY / Windows WinPTY
-  no ANSI, no parsing             tab completion, Ctrl-C
-  WebSocket protocol              Ctrl-] to detach
-           \                     /
-            same Python namespace
+ssh server pysh run work "x = 42"
+ssh server pysh run work "x + 1"     # 43 (remote state)
+
+ssh -t server pysh attach work       # interactive
 </pre>
 
-<h2>Two control surfaces</h2>
+<p>Per-call latency? That is what ssh <code>ControlMaster</code> is for:</p>
 
 <pre>
-pysh run work "x = 1"     # agent/script: one-shot command
-pysh attach work        # human developer: interactive attach
-pyctl status            # operator: daemon status
+# ~/.ssh/config
+Host server
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
 </pre>
 
-<p><code>pyctl</code> manages the daemon. <code>pysh</code> manages sessions.
-No command secretly starts the daemon, creates a session, and attaches in one
-step. <code>pysh attach</code> is a real PTY on POSIX/WSL. On native Windows it
-uses WinPTY, which preserves execution and shared state but is not fully
-byte-transparent for readline screen redraws. Use WSL when exact terminal
-behaviour matters.</p>
+<p>Need a TLS endpoint anyway? Terminate it with nginx or caddy in front of
+the loopback port. pythond does not ship a TLS stack.</p>
+
+<h2>HTTP API</h2>
+
+<p><code>pysh</code> speaks plain HTTP over a local socket; so does curl:</p>
+
+<pre>
+curl --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock \
+     --data-binary '1 + 1' http://pythond/run/work        # 2
+
+curl --unix-socket ... --data-binary @task.py http://pythond/run/work
+</pre>
+
+<pre>
+GET  /ls                      text listing
+POST /new/&lt;name&gt;              create session
+POST /run/&lt;name&gt;    body=code raw output; X-Pythond-Exec-Error: 1 on traceback
+POST /fire/&lt;name&gt;   body=code {"cell_id": ..., "status": "fired"}
+POST /fork/&lt;name&gt;   body=code {"cell_id": ..., "status": "forked"}
+GET  /poll/&lt;name&gt;[?cell=ID]   JSON cell result
+GET  /status/&lt;name&gt;           JSON health
+GET  /vars/&lt;name&gt;             JSON namespace names
+POST /complete/&lt;name&gt; body    JSON completion matches
+POST /int/&lt;name&gt;              JSON interrupt report
+POST /kill/&lt;name&gt;             kill session
+POST /stop                    stop daemon
+</pre>
+
+<p><code>404</code> no such session, <code>409</code> session channel broken,
+<code>401</code> bad token.</p>
+
+<h2>Attach</h2>
+
+<p><code>pysh attach work</code> is a client-side line REPL: readline history
+and tab completion live in the client, every complete block runs as one cell
+in the shared namespace. Ctrl-D detaches; the session stays alive
+(<code>pysh kill</code> ends it). It is line-oriented, not a PTY.</p>
 
 <h2>Commands</h2>
 
 <pre>
 pysh new &lt;name&gt;              create session
 pysh run &lt;name&gt; "code"       sync exec, raw output
+pysh run &lt;name&gt; @task.py     post a file's contents as the cell
 pysh fire &lt;name&gt; "code"      async thread, shares namespace (can't kill C code)
 pysh fork &lt;name&gt; "code"      async process (POSIX), killable, pickles vars back
 pysh poll &lt;name&gt; [cell_id]   check async result
@@ -172,90 +182,51 @@ pysh ls                      list sessions
 pysh status &lt;name&gt;           JSON health
 pysh vars &lt;name&gt;             JSON namespace names
 pysh complete &lt;name&gt; "text"  JSON completion candidates
-pysh attach &lt;name&gt;           human REPL (Ctrl-] to detach)
+pysh attach &lt;name&gt;           line REPL (Ctrl-D to detach)
 
-pyctl start [--listen H:P] [--tls] [--show-token]  start daemon
-pyctl stop                           stop daemon
-pyctl status                         daemon endpoint metadata and liveness
-pyctl connect &lt;name&gt; &lt;h:p&gt; &lt;tok&gt; [--tls]  proxy to remote
-pyctl disconnect &lt;name&gt;             drop remote
-pyctl cert                           show/generate TLS cert
-pyctl trust &lt;cert.pem&gt;              authorize client
-pyctl pin &lt;cert.pem&gt;                verify server
-</pre>
-
-<p><code>pyctl cert</code> prints the certificate path, key path,
-fingerprint, and role hints: copy this cert to the server for
-<code>pyctl trust</code> when this machine is a client, or copy it to the
-client for <code>pyctl pin</code> when this machine is a server.</p>
-
-<h2>Protocol</h2>
-
-<p>WebSocket text frames. First line = command. After newline = code body.
-Python code is never JSON-escaped.</p>
-
-<pre>
-ws.send("run work\nprint('hello')")    # "hello"
-ws.send("fire work\ntrain(epochs=50)") # {"cell_id":"..."}
-ws.send("ls")                          # "  work: alive"
+pyctl start [--show-token]   start daemon in foreground
+pyctl stop                   stop daemon
+pyctl status                 daemon liveness
 </pre>
 
 <h2>Security</h2>
 
-<p>The security model mirrors SSH:</p>
-
-<table>
-<tr><th>pythond</th><th>SSH equivalent</th></tr>
-<tr><td>token in <code>daemon.json</code></td><td>private key in <code>~/.ssh/</code></td></tr>
-<tr><td><code>pyctl trust cert.pem</code></td><td>adding a line to <code>authorized_keys</code></td></tr>
-<tr><td><code>pyctl pin cert.pem</code></td><td>adding a line to <code>known_hosts</code></td></tr>
-<tr><td>authenticated client</td><td>logged-in user</td></tr>
-</table>
-
-<p>Once authenticated, a client has full access to all sessions &mdash; no per-session permission isolation. Same as SSH: once you log in, you are that user with all their permissions.</p>
-
-<p>Not a sandbox: code runs with the daemon user's OS permissions.</p>
+<p>Treat pythond like SSH into a Python runtime. Not a sandbox: code runs
+with the daemon user's OS permissions. Once connected, a client has full
+access to all sessions &mdash; the same as a login shell.</p>
 
 <table>
 <tr><th>Mode</th><th>Auth</th></tr>
-<tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600</td></tr>
-<tr><td>Local Windows</td><td>TCP + token, OWNER RIGHTS DACL (owner-level isolation, comparable to Unix chmod 700)</td></tr>
-<tr><td>Remote</td><td>pinned self-signed TLS cert + token; optional mTLS client cert</td></tr>
+<tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600 &mdash; filesystem permissions</td></tr>
+<tr><td>Local Windows</td><td>127.0.0.1 + bearer token in <code>%LOCALAPPDATA%\pythond</code></td></tr>
+<tr><td>Remote</td><td>ssh's problem, on purpose</td></tr>
 </table>
 
-<p>Access logs are written as <code>ACCESS</code> lines to runtime <code>access.log</code>
-and mirrored to daemon stderr for supervisors. They include <code>conn_id</code>, peer,
-<code>cmd</code>, session, status, and <code>body_bytes</code>; they do not include tokens
-or Python code bodies.</p>
+<p>The daemon never binds a non-loopback address. There is no network
+listener to harden.</p>
 
 <p>Session names are lowercase only: <code>a-z</code>, <code>0-9</code>,
-underscore, and hyphen, up to 80 characters. Windows reserved device names such
-as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and <code>LPT1</code>
-are rejected.</p>
+underscore, and hyphen, up to 80 characters. Windows reserved device names
+such as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and
+<code>LPT1</code> are rejected.</p>
 
-<p>Like shell history and environment variables under SSH, pythond session
-history, logs, and live namespaces can expose secrets. <code>history.py</code>
-and <code>session.log</code> may contain executed Python source and captured
-output. Do not paste API keys, passwords, tokens, or other secrets into cells
-unless you are willing for them to persist in that session and its local files.</p>
+<p>Like shell history under SSH, pythond session history and live namespaces
+can expose secrets. <code>history.py</code> may contain executed Python
+source. Do not paste API keys, passwords, tokens, or other secrets into cells
+unless you are willing for them to persist in that session and its local
+files.</p>
 
 <h2>Platform</h2>
 
 <table>
-<tr><th>Platform</th><th>PTY</th><th>Transport</th><th>Attach behaviour</th></tr>
-<tr><td>Linux / macOS / WSL</td><td>pty.openpty()</td><td>AF_UNIX WebSocket</td><td>raw byte-transparent PTY</td></tr>
-<tr><td>Windows</td><td>pywinpty</td><td>TCP WebSocket</td><td>console bridge; some readline redraws are degraded</td></tr>
+<tr><th>Platform</th><th>Transport</th><th>Notes</th></tr>
+<tr><td>Linux / macOS / WSL</td><td>HTTP over AF_UNIX</td><td>full featured</td></tr>
+<tr><td>Windows</td><td>HTTP over 127.0.0.1 + token</td><td>full featured except fork (no COW fork)</td></tr>
 </table>
 
 <h2>Dependencies</h2>
 
-<table>
-<tr><th>Package</th><th>Role</th></tr>
-<tr><td>websockets</td><td>protocol transport</td></tr>
-<tr><td>wsproto</td><td>raw WSS client framing</td></tr>
-<tr><td>cryptography</td><td>TLS cert generation and pinning</td></tr>
-<tr><td>pywinpty</td><td>Windows PTY (Windows only)</td></tr>
-</table>
+<p>None. Python standard library only.</p>
 
 <hr>
 
