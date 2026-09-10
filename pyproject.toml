@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pythond"
-version = "0.5.1"
+version = "0.5.2"
 description = "Persistent Python sessions. Code in, result out."
 readme = "README.md"
 license = "MIT"
