@@ -46,17 +46,17 @@ jobs:
       - name: Install wheel
         run: python -m pip install --force-reinstall dist/*.whl
 
-      - name: CLI smoke — pythond
+      - name: CLI smoke -- pythond
         run: |
           pythond --help >/dev/null
           pythond --version
 
-      - name: CLI smoke — pysh
+      - name: CLI smoke -- pysh
         run: |
           pysh --help >/dev/null
           pysh --version
 
-      - name: CLI smoke — pyctl
+      - name: CLI smoke -- pyctl
         run: |
           pyctl --help >/dev/null
           pyctl --version

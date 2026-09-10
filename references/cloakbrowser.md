@@ -1,8 +1,8 @@
-# CloakBrowser — Stealth Web Browsing
+# CloakBrowser -- Stealth Web Browsing
 
 Source-level stealth Chromium. Dozens of C++ patches covering canvas, WebGL,
 audio, fonts, GPU, screen, WebRTC, network timing, and automation signals. No
-runtime JS injection — anti-bot systems cannot detect the patching.
+runtime JS injection -- anti-bot systems cannot detect the patching.
 
 Read this reference when the task involves web scraping, browsing behind
 anti-bot protection, or interacting with sites that detect automation.
@@ -23,7 +23,7 @@ print(page.title())
 ```
 
 `browser` and `page` persist in the pythond namespace. Do not call
-`browser.close()` — keep it alive across turns like any other connection.
+`browser.close()` -- keep it alive across turns like any other connection.
 
 With proxy and geo-IP:
 ```python
@@ -78,7 +78,7 @@ page = ctx.new_page()
 page.goto("https://protected-site.com")
 ctx.close()
 
-# Next run — cookies/localStorage restored
+# Next run -- cookies/localStorage restored
 ctx = launch_persistent_context("./my-profile", headless=False)
 ```
 
@@ -119,7 +119,7 @@ page.goto("https://pixelscan.net/")                     # "consistent" verdict =
 
 ## Advanced: cloakserve (standalone daemon)
 
-Use cloakserve when the browser must outlive Python — e.g. multiple pythond
+Use cloakserve when the browser must outlive Python -- e.g. multiple pythond
 sessions sharing one browser, or you need to restart Python without losing
 browser state. For most tasks launch() in a pythond session is simpler and
 sufficient.
@@ -165,11 +165,11 @@ page.goto("https://example.com")
 ```
 
 `pw` and `cloak` persist in the pythond namespace. If the session restarts,
-re-run these two lines — cloakserve is still up.
+re-run these two lines -- cloakserve is still up.
 
 ### Per-connection fingerprint
 
-Each connection gets a unique fingerprint seed via query params — different
+Each connection gets a unique fingerprint seed via query params -- different
 canvas, WebGL, fonts, timing for each:
 
 ```python

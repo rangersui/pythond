@@ -1,8 +1,8 @@
-# pythond — all files LF, no CRLF drift.
+# pythond -- all files LF, no CRLF drift.
 # Windows editors (and core.autocrlf=true) must not inject \r.
 
 * text=auto eol=lf
 
-# Binary assets — do not touch.
+# Binary assets -- do not touch.
 *.png binary
 *.ico binary

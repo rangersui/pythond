@@ -1,6 +1,6 @@
 ---
 name: pythond
-description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or ssh-reached pythond daemon sessions. Also covers stealth web browsing via bundled cloakbrowser reference — use when the task involves scraping, anti-bot evasion, or browser automation that must avoid detection.
+description: Persistent Python runtime for AI agents. Use when the agent needs to keep variables, imports, connections, sockets, threads, servers, or analysis state alive across turns. Send code through pysh run/fire/fork/poll. Attach a human REPL. Operate local or ssh-reached pythond daemon sessions. Also covers stealth web browsing via bundled cloakbrowser reference -- use when the task involves scraping, anti-bot evasion, or browser automation that must avoid detection.
 ---
 # pythond
 
@@ -64,13 +64,20 @@ pysh new work           # create a persistent session
 If daemon is not running, start it first. One daemon manages all sessions.
 Each session is an isolated subprocess with its own namespace.
 
+`new` never replaces an existing session by default: it returns a conflict and
+preserves live state, including under concurrent calls. Inspect `ls` / `status`
+to decide whether it is yours to reuse. Only use `pysh new work --replace`
+when discarding that session's variables, connections, and browser state is
+explicitly intended. Never automatically escalate a conflict to replacement.
+
 `pyctl start` is an alias for `pythond daemon`. Prefer `pythond daemon` in
 agent workflows; use `pyctl` for stop/status.
 
 ## Core Commands
 
 ```bash
-pysh new <name>              # create a persistent session
+pysh new <name>              # create; refuse an existing name
+pysh new <name> --replace    # explicitly discard existing state and replace
 pysh run <name> "code"       # sync exec/eval, raw output
 pysh fire <name> "code"      # async thread, shared namespace
 pysh fork <name> "code"      # async process, POSIX only, killable
@@ -177,7 +184,7 @@ pysh cp work: backup:           # clone the picklable namespace
 
 Use it to move parsed data between sessions instead of re-parsing, or to
 checkpoint expensive objects across daemon restarts. Unpicklable values
-(sockets, locks, modules) are skipped with a warning — reopen those in the
+(sockets, locks, modules) are skipped with a warning -- reopen those in the
 destination session.
 
 ## Output Formats
@@ -203,7 +210,7 @@ connection, so one-shot calls are enough:
 
 ```bash
 ssh server pysh run work "x = 42"
-ssh server pysh run work "x + 1"     # → 43 (remote state)
+ssh server pysh run work "x + 1"     # -> 43 (remote state)
 ```
 
 For per-call latency, enable ssh connection reuse once in `~/.ssh/config`:
@@ -225,17 +232,24 @@ export PYTHOND_HOST=127.0.0.1:7984 PYTHOND_TOKEN=<remote-token>
 pysh run work "code"
 ```
 
-## Direct HTTP (debugging)
+## Direct HTTP (clients and debugging)
 
 The daemon speaks plain HTTP; curl is the debug client:
 
 ```bash
 curl --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock \
-     --data-binary '1 + 1' http://pythond/run/work    # → 2
+     --data-binary '1 + 1' http://pythond/run/work    # -> 2
 ```
 
-Python source goes in the request body, raw -- never JSON-escaped. Normal use
-is `pysh`; the HTTP API is documented in the README.
+Python source goes in the request body, raw -- never JSON-escaped. Send
+`Content-Length` in UTF-8 bytes; chunked request bodies are not supported.
+Native adapters can use HTTP directly instead of spawning the CLI per call.
+
+`new` returns **201 Created**, or **409** if the name exists. Only `?replace=1`
+permits replacement. `fire` / `fork` return **202 Accepted** with a JSON receipt
+and `Location: /poll/<name>?cell=<id>`. That header locates the status monitor
+without parsing the body. Accept **2xx**, not only `200`. The HTTP API and SSE
+wire protocol are documented in the README.
 
 ## Security Model
 
@@ -274,6 +288,25 @@ Runtime files and durable state are separate:
 `fire` cells in one session execute serially under the session lock. Use
 multiple sessions for parallel execution.
 
+For agent adapters, prefer authenticated **`GET /events` (SSE)** over a polling
+loop. Subscribe before firing; completion is pushed by the worker, not found by
+a timer. Persist job ownership and the last processed event ID outside Python.
+Match `session_id` + `cell_id` to the owning conversation; the HTTP receipt's
+`X-Pythond-Session-Id` identifies the worker. Buffer completions that arrive
+before the receipt, and deduplicate replayed event IDs. Never broadcast a
+completion to whichever conversation happens to be active.
+
+Resume with `Last-Event-ID`. A `ready` event establishes the initial cursor;
+`cell_done` carries output/error, and `session_closed` reports worker loss.
+Replay is bounded (256 events / 8 MiB), not durable across daemon restarts.
+An expired cursor returns 410 (or `reset` on an open stream); a changed epoch
+returns 409. Reconcile with `poll` where possible; never automatically rerun
+code whose acceptance is uncertain. Closing the stream does not cancel work.
+
+Completion output is a UTF-8 tail of at most 64 KiB. If `output_truncated` is
+true, use the receipt's `Location` to fetch the full result while retained.
+Poll results are eligible for eviction 300s after **completion**, not launch.
+
 `pysh poll <session> <cell_id>` reads a specific cell.
 `pysh poll <session>` reads the most recent cell, or `{"status":"idle"}` if
 none exist.
@@ -288,14 +321,15 @@ changed while the fork was running.
 ## Session Lifecycle
 
 Sessions survive indefinitely while the daemon runs. If the daemon restarts,
-sessions are lost — replay from checkpoint history (see below). If a session
+sessions are lost -- replay from checkpoint history (see below). If a session
 crashes, create a new one with the same name and replay.
 
 ## Checkpoints
 
 Successful synchronous `run` cells are appended to
 `~/.pythond/sessions/<name>/history.py`. Successful async `fire`/`fork` cells
-are appended when `poll` observes completion. If a session dies, replay:
+are appended on completion, without requiring `poll` or a subscriber.
+If a session dies, replay:
 `pysh run <name> "exec(open(...).read())"`.
 
 Like shell history under SSH, pythond session history and live namespaces can
@@ -321,4 +355,4 @@ file when the task matches.
 
 | File                           | When to read                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `references/cloakbrowser.md` | Task involves web scraping, browsing behind anti-bot protection, or interacting with sites that detect automation. Default: `launch()` in a pythond session — one line, browser lives in the namespace. Advanced: cloakserve daemon for multi-session or Python-independent browser lifecycle. |
+| `references/cloakbrowser.md` | Task involves web scraping, browsing behind anti-bot protection, or interacting with sites that detect automation. Default: `launch()` in a pythond session -- one line, browser lives in the namespace. Advanced: cloakserve daemon for multi-session or Python-independent browser lifecycle. |

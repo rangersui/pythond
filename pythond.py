@@ -33,7 +33,8 @@ The debug client is curl:
        --data-binary '1 + 1' http://pythond/run/work
 
 Commands (pysh):
-    pysh new <name>              create a Python session
+    pysh new <name>              create; refuse an existing name
+    pysh new <name> --replace    explicitly discard and replace an existing session
     pysh run <name> "code"       sync eval/exec, raw output
     pysh fire <name> "code"      async thread -- shares namespace, can't kill C
     pysh fork <name> "code"      async process (POSIX only) -- killable, pickles vars back
@@ -52,18 +53,20 @@ Daemon (pyctl / pythond):
 
 HTTP API (what pysh speaks; curl speaks it too):
     GET  /ls                     text listing
-    POST /new/<name>             create session
+    POST /new/<name>             201 Created; 409 if name exists
+    POST /new/<name>?replace=1   201 Created; explicitly discard and replace
     POST /run/<name>   body=code raw output; X-Pythond-Exec-Error: 1 on traceback
-    POST /fire/<name>  body=code JSON {"cell_id": ..., "status": "fired"}
-    POST /fork/<name>  body=code JSON {"cell_id": ..., "status": "forked"}
+    POST /fire/<name>  body=code 202 Accepted; JSON cell_id + Location: /poll/...
+    POST /fork/<name>  body=code 202 Accepted; JSON cell_id + Location: /poll/...
     GET  /poll/<name>[?cell=ID]  JSON cell result
+    GET  /events                 SSE completions; Last-Event-ID for replay
     GET  /status/<name>          JSON health
     GET  /vars/<name>            JSON namespace names
     POST /complete/<name> body   JSON completion matches
     POST /int/<name>             JSON interrupt report
     POST /kill/<name>            kill session
     POST /stop                   stop daemon
-    404 = no such session/route, 409 = session channel broken, 401 = bad token.
+    404 = no such session/route, 409 = conflict, 401 = bad token.
 
 Security (same model as SSH):
   Not a sandbox: code runs with the daemon user's OS permissions.
@@ -72,7 +75,7 @@ Security (same model as SSH):
 
 Auto-checkpoint:
   ~/.pythond/sessions/<name>/history.py -- successful sync execs, plus async
-  execs when poll observes completion; replayable with exec(open(...).read()).
+  execs on completion (no poll required); replayable with exec(open(...).read()).
   History can contain secrets you paste into cells; treat it like shell history.
 
 fire vs fork:
@@ -92,6 +95,7 @@ import sys, os, socket, json, threading, uuid, io, traceback, time, tempfile
 import argparse
 import base64
 import codeop
+import collections
 import contextlib
 import ctypes
 import hmac
@@ -126,6 +130,11 @@ _SESSION_NAME_RULE = (
     "Windows device names are rejected."
 )
 _ASYNC_CELL_TTL = 300
+_MAX_EVENTS = max(1, int(os.environ.get("PYTHOND_MAX_EVENTS", "256")))
+_MAX_EVENT_BYTES = max(1, int(os.environ.get("PYTHOND_MAX_EVENT_BYTES",
+                                           str(8 * 1024 * 1024))))
+_EVENT_OUTPUT_BYTES = 64 * 1024
+_EVENT_HEARTBEAT = 15.0
 _SESSION_READY_TIMEOUT = 10.0
 _SEND_TIMEOUT = 30.0
 _CELL_SEQ = itertools.count()
@@ -447,6 +456,27 @@ def _kill_running_fork_pgids(cells: dict[str, JsonDict]) -> int:
     return killed
 
 
+def _notify_done(notify: typing.Callable[[JsonDict], None] | None,
+                 cid: str, result: JsonDict) -> None:
+    """Publish a bounded completion snapshot, outside the cell/exec locks."""
+    if notify is None:
+        return
+    raw = str(result["output"]).encode("utf-8", "replace")
+    limit = min(_EVENT_OUTPUT_BYTES, max(0, _MAX_WORKER_RESPONSE // 16))
+    event = {"type": "cell_done", "cell_id": cid, "status": "done",
+             "error": bool(result.get("_error")),
+             "output": raw[-limit:].decode("utf-8", "ignore") if limit else "",
+             "output_bytes": len(raw), "output_truncated": len(raw) > limit}
+    for key in ("merged", "skipped"):
+        if "_" + key in result:
+            event[key + "_count"] = len(result["_" + key])
+    try:
+        notify(event)
+    except Exception:
+        # A closed protocol pipe must not change a successfully computed result.
+        pass
+
+
 def _dispatch(
     cmd: str,
     args: list[str],
@@ -454,6 +484,7 @@ def _dispatch(
     cells: dict[str, JsonDict],
     ns: JsonDict,
     lock: threading.Lock | None = None,
+    notify: typing.Callable[[JsonDict], None] | None = None,
 ) -> JsonDict:
     """Handle one command inside a session worker.  Returns dicts only.
     lock, when provided, serializes fork merge with exec to prevent races."""
@@ -491,6 +522,7 @@ def _dispatch(
                     r["status"] = "done"
                     r["_done_at"] = time.time()
                     r["tid"] = None
+                _notify_done(notify, cid, r)
         t = threading.Thread(target=_bg, daemon=True)
         with _cells_lock:
             t.start()
@@ -687,6 +719,7 @@ def _dispatch(
                     r["_skipped"] = skipped
                     r["status"] = "done"
                     r["_done_at"] = time.time()
+                _notify_done(notify, cid, r)
         with _cells_lock:
             cells[cid] = res
             _evict_stale_cells(cells)
@@ -877,23 +910,29 @@ def _worker_main() -> None:
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, _term_handler)
 
+    # Replies and unsolicited events share a framed pipe, never concurrent writes.
+    proto_lock = threading.Lock()
+    def send(message: JsonDict) -> None:
+        payload = json.dumps(message)  # ASCII framing also handles lone surrogates.
+        with proto_lock:
+            proto_out.write(payload + "\n")
+            proto_out.flush()
+
     _exec = _make_exec(ns, lock)
-    proto_out.write(json.dumps({"ready": True, "pid": os.getpid()}) + "\n")
-    proto_out.flush()
+    send({"ready": True, "pid": os.getpid()})
     try:
         for line in proto_in:
             try:
                 msg = json.loads(line)
                 resp = _dispatch(msg["cmd"], msg.get("args", []),
-                                 _exec, cells, ns, lock)
-                payload = json.dumps(resp)
+                                 _exec, cells, ns, lock,
+                                 notify=lambda event: send({"_event": event}))
             except (json.JSONDecodeError, KeyError, TypeError):
-                payload = json.dumps({"error": "worker protocol error"})
+                resp = {"error": "worker protocol error"}
             except Exception:
-                payload = json.dumps({"error": "worker protocol error"})
+                resp = {"error": "worker protocol error"}
             try:
-                proto_out.write(payload + "\n")
-                proto_out.flush()
+                send(resp)
             except OSError:
                 break
     except KeyboardInterrupt:
@@ -911,26 +950,117 @@ _daemon_token: str | None = None
 _daemon_server: typing.Any = None
 
 
+class _EventCursorError(ValueError):
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(reason)
+        self.status = status
+
+
+class _EventLog:
+    """Bounded daemon-lifetime SSE replay log. Condition notification, not polling.
+
+    A cursor is epoch:sequence. Slow clients never block publishers: lagging
+    cursors fail explicitly rather than silently skipping evicted events.
+    """
+    def __init__(self, max_events: int = _MAX_EVENTS,
+                 max_bytes: int = _MAX_EVENT_BYTES) -> None:
+        self.epoch = uuid.uuid4().hex
+        self.sequence = 0
+        self.closed = False
+        self._cv = threading.Condition()
+        self._records: collections.deque[tuple[int, bytes]] = collections.deque()
+        self._bytes = 0
+        self._max_events = max_events
+        self._max_bytes = max_bytes
+
+    def cursor(self, sequence: int | None = None) -> str:
+        return f"{self.epoch}:{self.sequence if sequence is None else sequence}"
+
+    def _validate(self, after: int) -> None:
+        if after > self.sequence:
+            raise _EventCursorError(409, "event_cursor_ahead")
+        oldest = self._records[0][0] if self._records else self.sequence + 1
+        if after < oldest - 1:
+            raise _EventCursorError(410, "event_cursor_expired")
+
+    def subscribe(self, cursor: str | None) -> int:
+        with self._cv:
+            if cursor is None:
+                return self.sequence  # New subscription: future events only.
+            if not re.fullmatch(r"[a-f0-9]{32}:[0-9]{1,20}", cursor):
+                raise _EventCursorError(400, "invalid_event_cursor")
+            epoch, seq = cursor.split(":")
+            if epoch != self.epoch:
+                raise _EventCursorError(409, "event_epoch_changed")
+            after = int(seq)
+            self._validate(after)
+            return after
+
+    def publish(self, event: JsonDict) -> None:
+        payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        with self._cv:
+            if self.closed:
+                return
+            self.sequence += 1
+            frame = (f"id: {self.cursor()}\nevent: {event['type']}\ndata: ".encode()
+                     + payload + b"\n\n")
+            self._records.append((self.sequence, frame))
+            self._bytes += len(frame)
+            while (len(self._records) > self._max_events or
+                   self._bytes > self._max_bytes):
+                _, removed = self._records.popleft()
+                self._bytes -= len(removed)
+            self._cv.notify_all()
+
+    def next(self, after: int, timeout: float = _EVENT_HEARTBEAT
+             ) -> tuple[int, bytes] | None:
+        with self._cv:
+            self._validate(after)
+            self._cv.wait_for(lambda: self.closed or self.sequence > after, timeout)
+            self._validate(after)
+            for seq, frame in self._records:
+                if seq > after:
+                    return seq, frame
+            return None
+
+    def close(self) -> None:
+        with self._cv:
+            self.closed = True
+            self._cv.notify_all()
+
+
+_events = _EventLog()
+
+
 def _get_session(name: str) -> JsonDict | None:
     with _sessions_lock:
         return sessions.get(name)
 
 
-def _publish_session(name: str, s: JsonDict) -> None:
+def _publish_session(name: str, s: JsonDict, *, replace: bool = False) -> None:
     _validate_session_name(name)
     with _sessions_lock:
+        if not replace and name in sessions:
+            raise RuntimeError(f"session '{name}' already exists")
         if name not in sessions and len(sessions) >= _MAX_SESSIONS:
             raise RuntimeError(f"too many sessions (max {_MAX_SESSIONS})")
         old = sessions.get(name)
         sessions[name] = s
     if old is not None and old is not s:
         _close_session(old)
+        _session_closed(name, old, "replaced")
 
 
-def new_session(name: str) -> JsonDict:
-    """Create or replace one named Python session (a plain subprocess)."""
+def new_session(name: str, *, replace: bool = False) -> JsonDict:
+    """Create a worker; replacing live state requires explicit replace=True.
+
+    Reject cheaply before spawning, then recheck atomically at publication:
+    concurrent creators may both start workers, but only one can own the name.
+    """
     _validate_session_name(name)
     with _sessions_lock:
+        if not replace and name in sessions:
+            raise RuntimeError(f"session '{name}' already exists")
         if name not in sessions and len(sessions) >= _MAX_SESSIONS:
             raise RuntimeError(f"too many sessions (max {_MAX_SESSIONS})")
     env = {**os.environ, _WORKER_ENV: "1"}
@@ -941,29 +1071,37 @@ def new_session(name: str) -> JsonDict:
         start_new_session=(sys.platform != "win32"),
     )
     out_q: queue.Queue[str | None] = queue.Queue()
+    s: JsonDict = {"proc": proc, "q": out_q, "lock": threading.Lock(),
+                   "id": uuid.uuid4().hex, "unhealthy": False,
+                   "async_src": {}, "async_done": {}, "async_lock": threading.Lock()}
 
     def _reader() -> None:
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
-                out_q.put(line)
+                # Never enqueue events as replies: that desynchronizes run/status.
+                try:
+                    packet = json.loads(line)
+                except (ValueError, TypeError):
+                    packet = None
+                if isinstance(packet, dict) and isinstance(packet.get("_event"), dict):
+                    _worker_event(name, s, packet["_event"])
+                else:
+                    out_q.put(line)
         except Exception:
             pass  # worker died mid-line
         out_q.put(None)  # EOF sentinel
 
     threading.Thread(target=_reader, daemon=True).start()
-    s: JsonDict = {"proc": proc, "q": out_q, "lock": threading.Lock(),
-                   "unhealthy": False, "async_src": {}}
     try:
         line = out_q.get(timeout=_SESSION_READY_TIMEOUT)
         if line is None or not json.loads(line).get("ready"):
             raise RuntimeError("worker failed to start")
-    except (queue.Empty, json.JSONDecodeError):
-        with contextlib.suppress(Exception):
-            proc.kill()
+    except (queue.Empty, json.JSONDecodeError, RuntimeError):
+        _close_session(s)
         raise RuntimeError("worker failed to start")
     try:
-        _publish_session(name, s)
+        _publish_session(name, s, replace=replace)
     except Exception:
         _close_session(s)
         raise
@@ -981,6 +1119,7 @@ def _monitor_session(name: str, s: JsonDict) -> None:
         else:
             return
     _close_session(s)
+    _session_closed(name, s, "exited")
 
 
 def _close_session(s: JsonDict) -> None:
@@ -1012,6 +1151,7 @@ def kill_session(name: str) -> bool:
     if s is None:
         return False
     _close_session(s)
+    _session_closed(name, s, "killed")
     return True
 
 
@@ -1048,10 +1188,14 @@ def send_session(name: str, cmd: str, args: list[str],
             s["unhealthy"] = True
             return {"error": f"worker response too large; use kill {name} to restart"}
         try:
-            return typing.cast(JsonDict, json.loads(line))
+            resp = typing.cast(JsonDict, json.loads(line))
         except json.JSONDecodeError:
             s["unhealthy"] = True
             return {"error": f"malformed worker response; use kill {name} to restart"}
+        if cmd in ("fire", "fork") and resp.get("cell_id"):
+            _note_async_launch(name, s, args[0], resp)
+        resp["_session_id"] = s["id"]  # Bind HTTP receipts to the worker actually used.
+        return resp
 
 
 def _list_sessions() -> str:
@@ -1065,21 +1209,43 @@ def _list_sessions() -> str:
     return "\n".join(lines) or "(no sessions)"
 
 
-# _async_src: retained until poll pops it; dropped with the session
-def _note_async_launch(name: str, src: str, resp: JsonDict) -> None:
-    cid = resp.get("cell_id")
-    s = _get_session(name)
-    if cid and s is not None:
-        s["async_src"][cid] = src
+def _session_closed(name: str, s: JsonDict, reason: str) -> None:
+    _events.publish({"type": "session_closed", "session": name,
+                     "session_id": s["id"], "reason": reason})
 
 
-def _note_async_poll(name: str, resp: JsonDict, exec_error: bool) -> None:
-    s = _get_session(name)
-    if s is None:
-        return
-    src = s["async_src"].pop(resp.get("cell_id"), None)
-    if src and not exec_error and src.strip():
+def _complete_async(name: str, s: JsonDict, src: str, event: JsonDict) -> None:
+    if _get_session(name) is not s:
+        return  # A late event from a replaced worker must not affect its successor.
+    if src.strip() and not event.get("error"):
         _log_history(name, src)
+    _events.publish({**event, "session": name, "session_id": s["id"]})
+
+
+def _note_async_launch(name: str, s: JsonDict, src: str, resp: JsonDict) -> None:
+    cid = resp["cell_id"]
+    # Completion can arrive before fire's ACK. Match without ever taking the
+    # command lock in the pipe reader (doing so can deadlock the reply channel).
+    with s["async_lock"]:
+        event = s["async_done"].pop(cid, None)
+        if event is None:
+            s["async_src"][cid] = src
+    if event is not None:
+        _complete_async(name, s, src, event)
+
+
+def _worker_event(name: str, s: JsonDict, event: JsonDict) -> None:
+    if event.get("type") != "cell_done" or not isinstance(event.get("cell_id"), str):
+        return
+    if _get_session(name) is not s:
+        return
+    cid = event["cell_id"]
+    with s["async_lock"]:
+        src = s["async_src"].pop(cid, None)
+        if src is None:
+            s["async_done"][cid] = event
+    if src is not None:
+        _complete_async(name, s, src, event)
 
 # -----------------------------------------------
 # HTTP layer (stdlib; curl is the debug client)
@@ -1119,11 +1285,16 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
     except ValueError:
         return 400, headers, f"ERR invalid session name. {_SESSION_NAME_RULE}"
     if cmd == "new" and method == "POST":
+        policy = query.get("replace", ["0"])
+        if policy not in (["0"], ["1"]):
+            return 400, headers, "ERR replace must be 0 or 1"
         try:
-            s = new_session(name)
+            s = new_session(name, replace=policy == ["1"])
         except (ValueError, RuntimeError) as e:
             return 409, headers, f"ERR {_public_error(e)}"
-        return 200, headers, f"OK {name} pid={s['proc'].pid}"
+        headers["Location"] = f"/status/{_quote(name)}"
+        headers["X-Pythond-Session-Id"] = s["id"]
+        return 201, headers, f"OK {name} pid={s['proc'].pid}"
     if cmd == "kill" and method == "POST":
         if kill_session(name):
             return 200, headers, f"OK killed {name}"
@@ -1164,6 +1335,9 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         if cell:
             args = [cell]
     resp = send_session(name, cmd, args)
+    session_id = resp.pop("_session_id", None)
+    if session_id is not None:
+        headers["X-Pythond-Session-Id"] = session_id
 
     if "error" in resp and "_error" not in resp:
         msg = str(resp["error"])
@@ -1177,14 +1351,14 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         if exec_error:
             headers["X-Pythond-Exec-Error"] = "1"
         return 200, headers, output
-    if cmd in ("fire", "fork"):
-        _note_async_launch(name, body, resp)
-    elif cmd == "poll" and resp.get("status") == "done":
-        if exec_error:
-            resp["error"] = True
-        _note_async_poll(name, resp, exec_error)
+    if cmd == "poll" and resp.get("status") == "done" and exec_error:
+        resp["error"] = True
     if exec_error:
         headers["X-Pythond-Exec-Error"] = "1"
+    headers["Content-Type"] = "application/json"
+    if cmd in ("fire", "fork"):
+        headers["Location"] = f"/poll/{_quote(name)}?cell={_quote(str(resp['cell_id']))}"
+        return 202, headers, json.dumps(resp)
     return 200, headers, json.dumps(resp)
 
 
@@ -1207,6 +1381,7 @@ class _Handler(BaseHTTPRequestHandler):
         extra = dict(extra or {})
         content_type = extra.pop("Content-Type", "text/plain; charset=utf-8")
         self.send_response(status)
+        self.send_header("X-Pythond-Protocol", "2")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         for k, v in extra.items():
@@ -1222,6 +1397,60 @@ class _Handler(BaseHTTPRequestHandler):
         token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
         return hmac.compare_digest(token, _daemon_token)
 
+    def _event_stream(self, query: dict[str, list[str]]) -> None:
+        # Same bearer/socket auth as every other route. No token in the URL.
+        log = _events
+        cursors = query.get("since", [])
+        if len(cursors) > 1:
+            self._reply(400, "ERR supply one event cursor")
+            return
+        cursor = self.headers.get("Last-Event-ID")
+        if cursor is None and cursors:
+            cursor = cursors[0]
+        try:
+            after = log.subscribe(cursor)
+        except _EventCursorError as e:
+            self._reply(e.status, json.dumps({"error": str(e), "cursor": log.cursor()}),
+                        {"Content-Type": "application/json"})
+            return
+
+        self.close_connection = True  # Streaming, close-delimited HTTP/1.1 body.
+        self.connection.settimeout(5.0)  # A slow subscriber cannot hang a writer forever.
+        self.send_response(200)
+        self.send_header("X-Pythond-Protocol", "2")
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.send_header("X-Pythond-Event-Cursor", log.cursor(after))
+        self.end_headers()
+        try:
+            # Establish an SSE resume ID even before the first completion. Flush
+            # immediately, so a client can subscribe BEFORE submitting fire.
+            ready = json.dumps({"cursor": log.cursor(after)})
+            self.wfile.write((f"id: {log.cursor(after)}\nevent: ready\n"
+                              f"data: {ready}\n\n").encode())
+            self.wfile.flush()
+            while not log.closed:
+                try:
+                    item = log.next(after)
+                except _EventCursorError as e:
+                    # Headers already sent: signal a gap and close, never skip it.
+                    data = json.dumps({"error": str(e), "cursor": log.cursor()})
+                    self.wfile.write(f"event: reset\ndata: {data}\n\n".encode())
+                    self.wfile.flush()
+                    break
+                if log.closed:
+                    break
+                if item is None:
+                    self.wfile.write(b": heartbeat\n\n")
+                else:
+                    after, frame = item
+                    self.wfile.write(frame)
+                self.wfile.flush()
+        except OSError:
+            pass  # Disconnecting a subscriber does not interrupt Python work.
+
     def _route(self, method: str) -> None:
         if not self._authorized():
             self._reply(401, "ERR auth failed")
@@ -1231,7 +1460,14 @@ class _Handler(BaseHTTPRequestHandler):
         cmd = parts[0] if parts else ""
         name = parts[1] if len(parts) > 1 else ""
         var = parts[2] if len(parts) > 2 else ""
-        query = urllib.parse.parse_qs(parsed.query)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if parts == ["events"]:
+            if method != "GET":
+                self.close_connection = True
+                self._reply(405, "ERR wrong method", {"Connection": "close"})
+            else:
+                self._event_stream(query)
+            return
         body = b""
         if method == "POST":
             if self.headers.get("Transfer-Encoding"):
@@ -1281,7 +1517,8 @@ def daemon(show_token: bool = False) -> None:
     """Run the daemon in the foreground.  AF_UNIX on POSIX, 127.0.0.1 on
     Windows.  It never binds a non-loopback address -- remote access is ssh's
     job (see module docstring)."""
-    global _daemon_token, _daemon_server
+    global _daemon_token, _daemon_server, _events
+    _events = _EventLog()
     try:
         if _HAS_AF_UNIX:
             sock = _sock_path()
@@ -1338,6 +1575,7 @@ def daemon(show_token: bool = False) -> None:
     except KeyboardInterrupt:
         pass  # normal shutdown path
     finally:
+        _events.close()  # Wake idle subscriptions before closing the listener.
         with contextlib.suppress(Exception):
             server.server_close()
         for name in list(sessions):
@@ -1438,7 +1676,10 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
             if not args:
                 print(f"ERR usage: {cmd} <name>", file=sys.stderr)
                 sys.exit(1)
-            status, _h, text = _request("POST", f"/{cmd}/{_quote(args[0])}")
+            path = f"/{cmd}/{_quote(args[0])}"
+            if cmd == "new" and "--replace" in args[1:]:
+                path += "?replace=1"
+            status, _h, text = _request("POST", path)
             if cmd == "int" and status == 200:
                 text = _format_int(args[0], text)
         elif cmd in ("run", "fire", "fork"):
@@ -1669,6 +1910,8 @@ def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
     p_new = sub.add_parser("new", help="create session",
                            description=_SESSION_NAME_RULE)
     p_new.add_argument("name", help="canonical lowercase session name")
+    p_new.add_argument("--replace", action="store_true",
+                       help="discard existing session state and create a fresh worker")
     for cname, chelp in (
         ("run", "sync exec, raw output"),
         ("fire", "async thread exec"),
@@ -1708,6 +1951,9 @@ def _run_session_command(args: argparse.Namespace, argv: list[str]) -> None:
     if args.command == "attach":
         if not attach(args.name):
             sys.exit(1)
+        return
+    if args.command == "new":
+        client("new", [args.name] + (["--replace"] if args.replace else []))
         return
     client(args.command, argv[1:])
 

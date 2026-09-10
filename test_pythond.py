@@ -592,7 +592,8 @@ def _fake_session(lines=None):
     proc.stdin = _FakeStdin()
     proc.poll.return_value = None
     return {"proc": proc, "q": q, "lock": threading.Lock(),
-            "unhealthy": False, "async_src": {}}
+            "id": pythond.uuid.uuid4().hex, "unhealthy": False,
+            "async_src": {}, "async_done": {}, "async_lock": threading.Lock()}
 
 
 def _with_session(name, s):
@@ -700,26 +701,227 @@ def test_daemon_command_run_exec_error_header():
     check("success checkpointed", log.call_args.args == ("work", "2+2"))
 
 
-def test_daemon_command_async_history():
-    section("_daemon_command async history via poll")
+def test_async_http_receipts():
+    section("HTTP async receipts: 202 + Location, not execution results")
+    for cmd, state in (("fire", "fired"), ("fork", "forked")):
+        receipt = {"cell_id": "abc123", "status": state, "_session_id": "incarnation"}
+        with mock.patch.object(pythond, "send_session", return_value=receipt):
+            status, headers, body = _cmd("POST", cmd, "work", body=b"1+1")
+        check(f"{cmd} accepted", status == 202)
+        check(f"{cmd} status monitor in Location", headers.get("Location") ==
+              "/poll/work?cell=abc123")
+        check(f"{cmd} JSON content type", headers.get("Content-Type") == "application/json")
+        check(f"{cmd} worker identity in header",
+              headers.get("X-Pythond-Session-Id") == "incarnation")
+        check(f"{cmd} receipt body unchanged", json.loads(body) == {
+            "cell_id": "abc123", "status": state})
+        with mock.patch.object(pythond, "send_session", return_value={"error": "refused"}):
+            status, headers, _body = _cmd("POST", cmd, "work", body=b"1+1")
+        check(f"rejected {cmd} is not accepted", status == 409 and "Location" not in headers)
+
+
+def test_async_history_events():
+    section("async history and events, including completion before ACK")
     name = "__async_hist__"
-    s = _fake_session()
-    with _with_session(name, s):
-        with mock.patch.object(pythond, "send_session",
-                               return_value={"cell_id": "abc", "status": "fired"}):
-            status, _h, text = _cmd("POST", "fire", name, body=b"a = 1")
-        check("fire 200", status == 200)
-        check("async src retained", s["async_src"].get("abc") == "a = 1")
-        with mock.patch.object(pythond, "send_session",
-                               return_value={"cell_id": "abc", "status": "done",
-                                             "output": "", "_error": False}), \
-             mock.patch.object(pythond, "_log_history") as log:
-            status, _h, text = _cmd("GET", "poll", name,
-                                    query={"cell": ["abc"]})
-        check("poll done 200", status == 200)
-        check("poll checkpoints async src", log.call_args.args == (name, "a = 1"))
-        check("async src popped", "abc" not in s["async_src"])
+    for early in (False, True):
+        s = _fake_session([json.dumps({"cell_id": "abc", "status": "fired"})])
+        event = {"type": "cell_done", "cell_id": "abc", "status": "done",
+                 "error": False, "output": "1"}
+        with _with_session(name, s), \
+             mock.patch.object(pythond, "_log_history") as history, \
+             mock.patch.object(pythond, "_events", pythond._EventLog()) as log:
+            if early:
+                pythond._worker_event(name, s, event)
+                check("early completion waits for source", log.sequence == 0)
+            resp = pythond.send_session(name, "fire", ["a = 1"])
+            check("fire still receives ACK", resp.get("cell_id") == "abc", resp)
+            if not early:
+                # Simulate a command in flight: the event reader MUST NOT take
+                # the command lock, or it cannot read the command's reply next.
+                with s["lock"]:
+                    pythond._worker_event(name, s, event)
+            check("completion checkpoints without poll",
+                  history.call_args is not None and
+                  history.call_args.args == (name, "a = 1"))
+            check("source and early-result buffers emptied",
+                  not s["async_src"] and not s["async_done"])
+            check("one completion event published", log.sequence == 1)
+            check("no event queued as command reply", s["q"].empty())
+            frame = log.next(0, 0)[1].decode("utf-8")
+            check("event includes session incarnation", s["id"] in frame)
+            with mock.patch.object(pythond, "send_session", return_value={
+                    "cell_id": "abc", "status": "done", "output": "1"}):
+                _cmd("GET", "poll", name, query={"cell": ["abc"]})
+            check("poll cannot duplicate checkpoint or event",
+                  history.call_count == 1 and log.sequence == 1)
+
+            pythond._note_async_launch(name, s, "1/0", {"cell_id": "err"})
+            pythond._worker_event(name, s, {**event, "cell_id": "err", "error": True})
+            check("errors notify but do not checkpoint",
+                  log.sequence == 2 and history.call_count == 1)
+            replacement = _fake_session()
+            with _with_session(name, replacement):
+                pythond._worker_event(name, s, {**event, "cell_id": "late"})
+            check("old worker cannot notify as replacement", log.sequence == 2)
     pythond.sessions.pop(name, None)
+
+
+def test_new_safe_defaults():
+    section("new refuses existing state; replace is explicit and atomic")
+    name = "__safe_new__"
+    existing = _fake_session()
+    with _with_session(name, existing), \
+         mock.patch.object(pythond.subprocess, "Popen") as spawn, \
+         mock.patch.object(pythond, "_close_session") as close:
+        status, _h, text = _cmd("POST", "new", name)
+        check("default new conflicts", status == 409 and "already exists" in text)
+        check("existing worker untouched", pythond.sessions[name] is existing and
+              not close.called and not spawn.called)
+        try:
+            pythond._publish_session(name, _fake_session())
+            check("publication rechecks existing name", False)
+        except RuntimeError:
+            check("publication rechecks existing name", pythond.sessions[name] is existing)
+    pythond.sessions.pop(name, None)
+
+    with mock.patch.object(pythond, "new_session", return_value=existing) as new:
+        for policy, expected in (({}, False), ({"replace": ["0"]}, False),
+                                 ({"replace": ["1"]}, True)):
+            status, _h, _text = _cmd("POST", "new", name, query=policy)
+            check("route passes explicit replacement policy", status == 201 and
+                  new.call_args.kwargs == {"replace": expected}, new.call_args)
+        before = new.call_count
+        for value in ([""], ["true"], ["1", "0"]):
+            status, _h, _text = _cmd("POST", "new", name, query={"replace": value})
+            check("ambiguous replacement rejected", status == 400)
+        check("invalid replacement never spawns", new.call_count == before)
+
+    barrier = threading.Barrier(2)
+    winners, conflicts = [], []
+    def publish(s):
+        barrier.wait(timeout=5)
+        try:
+            pythond._publish_session(name, s)
+            winners.append(s)
+        except RuntimeError:
+            conflicts.append(s)
+    with mock.patch.dict(pythond.sessions, {}, clear=True):
+        threads = [threading.Thread(target=publish, args=(_fake_session(),))
+                   for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        check("concurrent publication has one winner",
+              len(winners) == len(conflicts) == 1 and
+              pythond.sessions.get(name) is winners[0])
+
+    # A creator that loses publication must reap its unowned worker, not leak it.
+    proc = _fake_session()["proc"]
+    proc.stdout = io.StringIO('{"ready": true}\n')
+    with mock.patch.object(pythond.subprocess, "Popen", return_value=proc), \
+         mock.patch.object(pythond, "_publish_session", side_effect=RuntimeError("race")), \
+         mock.patch.object(pythond, "_close_session") as close:
+        try:
+            pythond.new_session(name)
+            check("losing creation raises", False)
+        except RuntimeError:
+            check("losing worker reaped", close.call_count == 1 and
+                  close.call_args.args[0]["proc"] is proc)
+
+
+def test_event_log():
+    section("bounded event replay, cursor gaps, shutdown wakeup")
+    log = pythond._EventLog(max_events=2)
+    origin = log.cursor()
+    results = []
+    waiting = threading.Event()
+    def wait():
+        waiting.set()
+        results.append(log.next(0, 5))
+    t = threading.Thread(target=wait, daemon=True)
+    t.start()
+    waiting.wait(2)
+    log.publish({"type": "cell_done", "output": "你好\nsecond line"})
+    t.join(timeout=2)
+    check("publisher wakes subscriber", len(results) == 1 and results[0] is not None)
+    check("UTF-8 JSON remains one SSE data line",
+          b'\\nsecond line' in results[0][1] and
+          "你好".encode() in results[0][1])
+    check("replay is not consuming", log.next(0, 0) == results[0])
+    check("new subscriber starts at current cursor", log.subscribe(None) == 1)
+    log.publish({"type": "cell_done", "cell_id": "two"})
+    log.publish({"type": "cell_done", "cell_id": "three"})
+    for cursor, status in ((origin, 410), (log.cursor(99), 409),
+                           (pythond._EventLog().cursor(), 409), ("bad", 400)):
+        try:
+            log.subscribe(cursor)
+            check("bad cursor rejected", False, cursor)
+        except pythond._EventCursorError as e:
+            check("bad cursor status", e.status == status, e)
+    check("retained boundary is replayable", log.subscribe(log.cursor(1)) == 1)
+    try:
+        log.next(0, 0)
+        check("slow subscriber sees gap", False)
+    except pythond._EventCursorError as e:
+        check("slow subscriber sees gap", e.status == 410)
+    tiny = pythond._EventLog(max_bytes=1)
+    tiny.publish({"type": "cell_done", "output": "too large"})
+    check("byte budget enforced even for one oversized event", tiny._bytes == 0)
+    try:
+        tiny.subscribe(tiny.cursor(0))
+        check("oversized eviction is explicit", False)
+    except pythond._EventCursorError as e:
+        check("oversized eviction is explicit", e.status == 410)
+    results.clear()
+    t = threading.Thread(target=lambda: results.append(log.next(3, 5)), daemon=True)
+    t.start()
+    log.close()
+    t.join(timeout=2)
+    check("close wakes idle subscription", results == [None])
+
+
+def test_event_stream_reset():
+    section("stream signals retention gap after headers")
+    handler = object.__new__(pythond._Handler)
+    handler.wfile = io.BytesIO()
+    handler.connection = mock.Mock()
+    handler.headers = {}
+    handler.send_response = mock.Mock()
+    handler.send_header = mock.Mock()
+    handler.end_headers = mock.Mock()
+    log = pythond._EventLog()
+    with mock.patch.object(pythond, "_events", log), \
+         mock.patch.object(log, "next", side_effect=pythond._EventCursorError(
+             410, "event_cursor_expired")):
+        handler._event_stream({})
+    data = handler.wfile.getvalue()
+    check("gap is reset event, not silent skip",
+          b"event: reset\n" in data and b"event_cursor_expired" in data)
+    check("gap closes connection", handler.close_connection)
+
+
+def test_completion_snapshot():
+    section("completion snapshot bounded independently of poll TTL")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    cells = {}
+    events = queue.Queue()
+    resp = pythond._dispatch("fire", ["print('汉' * 30000)"],
+                             pythond._make_exec(ns, lock), cells, ns, lock,
+                             notify=events.put)
+    event = events.get(timeout=5)
+    check("completion cell identity", event["cell_id"] == resp["cell_id"])
+    check("large output flagged", event["output_truncated"] and
+          event["output_bytes"] == 90000)
+    check("snapshot tail is valid UTF-8 and bounded",
+          len(event["output"].encode()) <= pythond._EVENT_OUTPUT_BYTES and
+          set(event["output"]) == {"汉"})
+    cid = resp["cell_id"]
+    cells[cid]["_done_at"] = time.time() - pythond._ASYNC_CELL_TTL - 1
+    pythond._evict_stale_cells(cells)
+    check("eviction doesn't consume delivered snapshot",
+          cid not in cells and event["output_bytes"] == 90000)
 
 
 def test_dispatch_dump_load():
@@ -1100,6 +1302,28 @@ def test_pysh_cli_smoke():
          mock.patch.object(pythond, "attach", return_value=True) as attach_fn:
         pythond.pysh_main()
     check("pysh attach delegates", attach_fn.call_args.args == ("work",))
+    for argv, path in ((["new", "work"], "/new/work"),
+                       (["new", "work", "--replace"], "/new/work?replace=1"),
+                       (["new", "--replace", "work"], "/new/work?replace=1")):
+        with mock.patch.object(sys, "argv", ["pysh"] + argv), \
+             mock.patch.object(pythond, "_request", return_value=(201, {}, "OK")) as req, \
+             mock.patch.object(sys, "stdout", io.StringIO()):
+            pythond.pysh_main()
+        check("CLI replacement is opt-in", req.call_args.args == ("POST", path))
+    with mock.patch.object(sys, "argv", ["pysh", "new", "work"]), \
+         mock.patch.object(pythond, "_request", return_value=(409, {}, "ERR already exists")), \
+         mock.patch.object(sys, "stderr", io.StringIO()):
+        try:
+            pythond.pysh_main()
+            check("CLI conflict exits nonzero", False)
+        except SystemExit as e:
+            check("CLI conflict exits nonzero", e.code == 1)
+    for cmd in ("fire", "fork"):
+        with mock.patch.object(sys, "argv", ["pysh", cmd, "work", "1+1"]), \
+             mock.patch.object(pythond, "_request", return_value=(202, {}, '{"cell_id":"abc"}')), \
+             mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            pythond.pysh_main()
+        check(f"CLI accepts {cmd} 202", json.loads(out.getvalue())["cell_id"] == "abc")
 
 
 # ===========================================
@@ -1127,9 +1351,13 @@ def wait_until(predicate, timeout=10.0, interval=0.05):
 class _Daemon:
     """Start a real daemon subprocess; route this test process's client
     (pythond._request) at it."""
-    def __init__(self, tmpdir):
+    def __init__(self, tmpdir, extra_env=None):
         self.tmp = tmpdir
-        self.env = os.environ.copy()
+        # Never inherit a production endpoint, token, or checkpoint directory.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHOND_")}
+        self.env.update({"HOME": tmpdir, "USERPROFILE": tmpdir, "LOCALAPPDATA": tmpdir,
+                         "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+        self.env.update(extra_env or {})
         self.patches = []
         if _HAS_AF_UNIX:
             self.sock = os.path.join(tmpdir, "pythond.sock")
@@ -1139,15 +1367,14 @@ class _Daemon:
             self.port = free_tcp_port()
             self.env["LOCALAPPDATA"] = tmpdir
             self.env["PYTHOND_PORT"] = str(self.port)
-            self.patches.append(mock.patch.dict(
-                os.environ, {"LOCALAPPDATA": tmpdir,
-                             "PYTHOND_PORT": str(self.port)}))
+        self.patches.append(mock.patch.dict(os.environ, self.env, clear=True))
         self.proc = None
 
     def __enter__(self):
         self.proc = subprocess.Popen(
             [sys.executable, str(ROOT / "pythond.py"), "daemon"],
             env=self.env, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
         self._stderr_chunks = []
         def _drain():
@@ -1171,15 +1398,241 @@ class _Daemon:
         return "".join(self._stderr_chunks)
 
     def __exit__(self, *exc):
-        for p in self.patches:
-            p.stop()
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=3)
+        try:
+            if self.proc.poll() is None:
+                # Graceful HTTP stop also reaps workers on Windows.
+                with contextlib.suppress(OSError):
+                    pythond._request("POST", "/stop")
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=3)
+        finally:
+            for p in reversed(self.patches):
+                p.stop()
+
+
+class _Events:
+    """Blocking SSE test client: waits for pushed events, never calls poll."""
+    def __init__(self, cursor=None, path="/events"):
+        self.request_cursor = cursor
+        self.path = path
+
+    def __enter__(self):
+        self.conn, token = pythond._connect()
+        self.conn.timeout = 8
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if self.request_cursor is not None:
+            headers["Last-Event-ID"] = self.request_cursor
+        self.conn.request("GET", self.path, headers=headers)
+        self.response = self.conn.getresponse()
+        if self.response.status != 200:
+            body = self.response.read().decode("utf-8")
+            self.close()
+            raise RuntimeError(f"SSE {self.response.status}: {body}")
+        self.cursor = self.response.getheader("X-Pythond-Event-Cursor")
+        check("SSE content type", self.response.getheader("Content-Type").startswith(
+            "text/event-stream"))
+        return self
+
+    def read(self):
+        fields = {}
+        while True:
+            line = self.response.readline(1024 * 1024)
+            if not line:
+                raise EOFError("event stream ended before expected event")
+            line = line.decode("utf-8").rstrip("\r\n")
+            if not line:
+                if fields:
+                    fields["data"] = json.loads(fields["data"])
+                    if fields.get("event") == "ready":
+                        check("ready event establishes resume cursor", fields["id"] == self.cursor and
+                              fields["data"]["cursor"] == self.cursor)
+                        fields = {}
+                        continue
+                    return fields
+                continue
+            if not line.startswith(":"):
+                key, _, value = line.partition(":")
+                fields[key] = value.lstrip(" ")
+
+    def close(self):
+        self.response.close()
+        self.conn.close()
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def test_integration_safe_new():
+    section("INTEGRATION: safe new, explicit replacement, concurrent creators")
+    with tempfile.TemporaryDirectory() as td, _Daemon(td):
+        status, headers, original = pythond._request("POST", "/new/work")
+        check("initial creation returns 201", status == 201, original)
+        check("creation Location points to session health", headers.get("Location") == "/status/work")
+        check("creation receipt includes incarnation", bool(headers.get("X-Pythond-Session-Id")))
+        pythond._request("POST", "/run/work", "sentinel = object(); marker = id(sentinel)")
+        for suffix, expected in (("", 409), ("?replace=0", 409),
+                                 ("?replace=", 400), ("?replace=true", 400),
+                                 ("?replace=1&replace=0", 400)):
+            status, _h, text = pythond._request("POST", "/new/work" + suffix)
+            check("repeat new preserves state", status == expected, text)
+        status, _h, text = pythond._request("POST", "/run/work", "id(sentinel) == marker")
+        check("live object identity survives refused new", status == 200 and text == "True")
+        status, _h, fresh = pythond._request("POST", "/new/work?replace=1")
+        check("explicit replacement has fresh PID", status == 201 and fresh != original)
+        _s, _h, text = pythond._request("GET", "/vars/work")
+        check("explicit replacement discards variables", "sentinel" not in json.loads(text)["vars"])
+
+        barrier = threading.Barrier(8)
+        results = []
+        def create():
+            barrier.wait(timeout=5)
+            results.append(pythond._request("POST", "/new/race"))
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+        check("eight concurrent creators: one success, seven conflicts",
+              sorted(r[0] for r in results) == [201] + [409] * 7, results)
+        _s, _h, listing = pythond._request("GET", "/ls")
+        check("only one race session published", listing.count("race:") == 1, listing)
+        _s, _h, text = pythond._request("POST", "/run/race", "6 * 7")
+        check("winning worker remains usable", text == "42", text)
+
+
+def test_integration_events():
+    section("INTEGRATION: pushed completion, replay, IPC isolation, session loss")
+    with tempfile.TemporaryDirectory() as td, _Daemon(td) as d:
+        pythond._request("POST", "/new/work")
+        with _Events() as a, _Events() as b:
+            status, headers, text = pythond._request("POST", "/fire/work", "print('你好\\nsecond line')")
+            cid = json.loads(text)["cell_id"]
+            check("fire returns 202 and status Location", status == 202 and
+                  headers.get("Location") == f"/poll/work?cell={cid}")
+            one, other = a.read(), b.read()
+            check("all subscribers receive same event", one == other)
+            data = one["data"]
+            incarnation = data["session_id"]
+            check("completion matches receipt incarnation",
+                  incarnation == headers.get("X-Pythond-Session-Id"))
+            check("instant Unicode completion associated with ACK",
+                  one["event"] == "cell_done" and data["cell_id"] == cid and
+                  data["session"] == "work" and data["output"] == "你好\nsecond line" and
+                  data["error"] is False, one)
+
+            pythond._request("POST", "/fire/work", "raise ValueError('bad-news')")
+            failure = a.read()
+            check("exception completion has error flag", failure["data"]["error"] is True and
+                  "ValueError" in failure["data"]["output"])
+            check("exception multicast", b.read() == failure)
+
+            ids = []
+            for i in range(12):
+                _s, _h, text = pythond._request("POST", "/fire/work", f"print({i})")
+                ids.append(json.loads(text)["cell_id"])
+                _s, _h, text = pythond._request("GET", "/status/work")
+                check("events never replace command replies", "state" in json.loads(text), text)
+            delivered = [a.read() for _ in ids]
+            check("rapid completions are neither lost nor duplicated",
+                  [e["data"]["cell_id"] for e in delivered] == ids)
+            check("independent subscriber cursors", [b.read() for _ in ids] == delivered)
+            cursor = delivered[-1]["id"]
+            history = (Path(td) / ".pythond/sessions/work/history.py").read_text(encoding="utf-8")
+            check("async checkpoint without poll", "print(11)" in history and
+                  "bad-news" not in history)
+
+        # No subscribers are required for the cell to run or for log retention.
+        _s, _h, text = pythond._request("POST", "/fire/work",
+                                       "import time; time.sleep(0.1); survived = 17")
+        cid = json.loads(text)["cell_id"]
+        with _Events(cursor) as resumed:
+            completed = resumed.read()
+            check("disconnect doesn't abort work", completed["data"]["cell_id"] == cid and
+                  completed["data"]["error"] is False)
+        with _Events(cursor) as repeated:
+            check("replayed event keeps its deduplication ID", repeated.read() == completed)
+            _s, _h, text = pythond._request("POST", "/run/work", "survived")
+            check("namespace survives resubscription", text == "17", text)
+
+            _s, _h, text = pythond._request("POST", "/fire/work", "time.sleep(0.1); print('done')")
+            cid = json.loads(text)["cell_id"]
+            _s, _h, text = pythond._request("POST", "/run/work", "time.sleep(0.2); 42")
+            check("completion during locked run does not deadlock", text == "42", text)
+            check("completion during run is correctly framed", repeated.read()["data"]["cell_id"] == cid)
+            check("normal notification path made no poll requests", "/poll/" not in d.stderr())
+
+            _s, headers, _text = pythond._request("POST", "/fire/work", "print('汉' * 30000)")
+            large = repeated.read()["data"]
+            check("large notification bounded and flagged", large["output_truncated"] and
+                  large["output_bytes"] == 90000 and len(large["output"].encode()) <= 65536)
+            _s, _h, text = pythond._request("GET", headers["Location"])
+            check("Location fetches full output without parsing receipt body", json.loads(text)["output"] == "汉" * 30000)
+
+            pythond._request("POST", "/kill/work")
+            ended = repeated.read()
+            check("kill emits session loss", ended["event"] == "session_closed" and
+                  ended["data"]["session_id"] == incarnation and ended["data"]["reason"] == "killed")
+            pythond._request("POST", "/new/work")
+            pythond._request("POST", "/fire/work", "1 + 1")
+            check("reused name has different incarnation",
+                  repeated.read()["data"]["session_id"] != incarnation)
+            pythond._request("POST", "/run/work", "os._exit(7)")
+            check("worker crash notifies subscribers", repeated.read()["data"]["reason"] == "exited")
+            pythond._request("POST", "/stop")
+            check("daemon stop closes idle stream promptly", repeated.response.read() == b"")
+
+
+def test_integration_event_cursors():
+    section("INTEGRATION: cursor validation, retention gaps, daemon epoch")
+    with tempfile.TemporaryDirectory() as td:
+        with _Daemon(td, {"PYTHOND_MAX_EVENTS": "2"}):
+            pythond._request("POST", "/new/work")
+            with _Events() as events:
+                origin = events.cursor
+                delivered = []
+                for i in range(3):
+                    pythond._request("POST", "/fire/work", str(i))
+                    delivered.append(events.read())
+            for cursor, expected in ((origin, 410), ("bad", 400), ("", 400),
+                                     (origin.split(":")[0] + ":99", 409)):
+                status, _h, body = pythond._request("GET", "/events?since=" + cursor)
+                check("invalid or stale cursor HTTP status", status == expected, body)
+                check("cursor errors machine readable", "error" in json.loads(body))
+            status, _h, _body = pythond._request("GET", "/events?since=x&since=y")
+            check("multiple cursors rejected", status == 400)
+            status, _h, _body = pythond._request("POST", "/events")
+            check("events is GET only", status == 405)
+            with _Events(path="/events?since=" + delivered[-2]["id"]) as events:
+                check("query cursor replay", events.read() == delivered[-1])
+            with _Events(delivered[-2]["id"], "/events?since=bad") as events:
+                check("Last-Event-ID takes precedence", events.read() == delivered[-1])
+        with _Daemon(td):
+            status, _h, body = pythond._request("GET", "/events?since=" + delivered[-1]["id"])
+            check("restart rejects old epoch", status == 409 and
+                  json.loads(body)["error"] == "event_epoch_changed", body)
+
+
+def test_integration_event_fork():
+    section("INTEGRATION: fork completion and interrupt events")
+    if sys.platform == "win32":
+        check("fork events skipped on Windows", True)
+        return
+    with tempfile.TemporaryDirectory() as td, _Daemon(td):
+        pythond._request("POST", "/new/work")
+        with _Events() as events:
+            status, headers, text = pythond._request("POST", "/fork/work", "answer = 42")
+            check("fork returns 202 and status Location", status == 202 and
+                  headers.get("Location") == f"/poll/work?cell={json.loads(text)['cell_id']}")
+            data = events.read()["data"]
+            check("fork completion after merge", not data["error"] and data["merged_count"] >= 1)
+            _s, _h, text = pythond._request("POST", "/run/work", "answer")
+            check("pushed fork result already merged", text == "42")
+            pythond._request("POST", "/fork/work", "time.sleep(30)")
+            pythond._request("POST", "/int/work")
+            check("killed fork emits failure completion", events.read()["data"]["error"] is True)
 
 
 def test_integration_lifecycle():
@@ -1190,9 +1643,10 @@ def test_integration_lifecycle():
     with tempfile.TemporaryDirectory() as td, _Daemon(td) as d:
         status, _h, text = pythond._request("GET", "/ls")
         check("ls empty", status == 200 and "(no sessions)" in text, text)
+        check("HTTP protocol capability advertised", _h.get("X-Pythond-Protocol") == "2")
 
         status, _h, text = pythond._request("POST", f"/new/{name}")
-        check("new OK", status == 200 and f"OK {name}" in text, text)
+        check("new Created", status == 201 and f"OK {name}" in text, text)
 
         status, _h, text = pythond._request("GET", "/ls")
         check("ls has session", name in text and "alive" in text, text)
@@ -1322,7 +1776,10 @@ def test_integration_auth():
         with mock.patch.dict(os.environ, {"PYTHOND_TOKEN": "wrong",
                                           "PYTHOND_HOST": f"127.0.0.1:{d.port}"}):
             status, _h, text = pythond._request("GET", "/ls")
+            event_status, _h, event_text = pythond._request("GET", "/events")
         check("wrong token 401", status == 401 and "auth failed" in text, text)
+        check("event stream uses same authentication", event_status == 401 and
+              "auth failed" in event_text)
         pythond._request("POST", "/stop")
 
 
@@ -1334,6 +1791,7 @@ def test_integration_second_daemon_fails():
         second = subprocess.run(
             [sys.executable, str(ROOT / "pythond.py"), "daemon"],
             env=d.env, capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
         check("second daemon exits nonzero", second.returncode == 1,
               second.stderr)
@@ -1491,7 +1949,12 @@ def main():
         test_send_session_dead_worker,
         test_daemon_command_routing,
         test_daemon_command_run_exec_error_header,
-        test_daemon_command_async_history,
+        test_async_http_receipts,
+        test_async_history_events,
+        test_new_safe_defaults,
+        test_event_log,
+        test_event_stream_reset,
+        test_completion_snapshot,
         test_dispatch_dump_load,
         test_daemon_command_pickle_route,
         test_parse_cp_target,
@@ -1508,6 +1971,10 @@ def main():
         test_pysh_cli_smoke,
 
         # Integration tests
+        test_integration_safe_new,
+        test_integration_events,
+        test_integration_event_cursors,
+        test_integration_event_fork,
         test_integration_lifecycle,
         test_integration_crash_isolation,
         test_integration_auth,
@@ -1520,8 +1987,11 @@ def main():
                   if name.startswith("test_") and callable(obj)}
     missing = sorted(discovered - registered)
     check("all test functions registered", not missing, ", ".join(missing))
-    for fn in tests:
-        fn()
+    # Unit checkpoint tests must not write/delete anything in the real home.
+    with tempfile.TemporaryDirectory(prefix="pythond-tests-") as home, \
+         mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+        for fn in tests:
+            fn()
 
     print(f"\n{'='*40}")
     print(f"  {PASS} passed, {FAIL} failed")

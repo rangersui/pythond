@@ -144,11 +144,13 @@ curl --unix-socket ... --data-binary @task.py http://pythond/run/work
 
 <pre>
 GET  /ls                      text listing
-POST /new/&lt;name&gt;              create session
-POST /run/&lt;name&gt;    body=code raw output; X-Pythond-Exec-Error: 1 on traceback
-POST /fire/&lt;name&gt;   body=code {"cell_id": ..., "status": "fired"}
-POST /fork/&lt;name&gt;   body=code {"cell_id": ..., "status": "forked"}
-GET  /poll/&lt;name&gt;[?cell=ID]   JSON cell result
+POST /new/&lt;name&gt;              201 Created; 409 if name exists
+POST /new/&lt;name&gt;?replace=1    201 Created; explicitly discard and replace
+POST /run/&lt;name&gt;    body=code 200 + raw output; X-Pythond-Exec-Error: 1 on traceback
+POST /fire/&lt;name&gt;   body=code 202 Accepted; JSON receipt + Location: /poll/...
+POST /fork/&lt;name&gt;   body=code 202 Accepted; JSON receipt + Location: /poll/...
+GET  /poll/&lt;name&gt;[?cell=ID]   200 + JSON cell result
+GET  /events                  200 + SSE completions; Last-Event-ID for replay
 GET  /status/&lt;name&gt;           JSON health
 GET  /vars/&lt;name&gt;             JSON namespace names
 POST /complete/&lt;name&gt; body    JSON completion matches
@@ -159,8 +161,59 @@ POST /kill/&lt;name&gt;             kill session
 POST /stop                    stop daemon
 </pre>
 
-<p><code>404</code> no such session, <code>409</code> session channel broken,
-<code>401</code> bad token.</p>
+<p><code>404</code> no such session, <code>409</code> existing name or broken
+session channel, <code>401</code> bad token. Send raw UTF-8 source with an
+explicit byte-count <code>Content-Length</code>; chunked request bodies get
+<code>411</code>.</p>
+
+<p><code>new</code> returns <code>201 Created</code>, text confirmation, and
+<code>Location: /status/&lt;name&gt;</code>. Async calls return receipts, not
+execution results:</p>
+<pre>HTTP/1.1 202 Accepted
+Content-Type: application/json
+Location: /poll/work?cell=abc123
+X-Pythond-Session-Id: &lt;worker-incarnation&gt;
+
+{"cell_id": "abc123", "status": "fired"}</pre>
+<p>The <code>Location</code> header locates the status monitor without parsing
+the body (<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3">RFC
+9110 section 15.3.3</a>). Acceptance is not execution success. Clients should accept
+<b>2xx</b>, not only 200. <code>run</code> and <code>kill</code> retain their
+200 text responses.</p>
+
+<h2>Completion events: no polling loop</h2>
+<pre>curl -N --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock http://pythond/events</pre>
+<p>Subscribe before submitting work. Workers push completion frames to the
+daemon; a condition notification wakes subscribers. The daemon does not scan
+cells or call <code>poll</code>. TCP uses the same bearer-token header as other
+routes. Fifteen-second SSE comments are connection heartbeats, not task polling.</p>
+<ul>
+<li><code>ready</code> establishes the initial event ID, also available in
+<code>X-Pythond-Event-Cursor</code>. No cursor means future events only.</li>
+<li><code>cell_done</code> carries JSON: session name, <code>session_id</code>
+(worker incarnation), <code>cell_id</code>, <code>status: "done"</code>, boolean
+<code>error</code>, <code>output</code>, <code>output_bytes</code>, and
+<code>output_truncated</code>. Fork adds merged/skipped counts.</li>
+<li><code>session_closed</code> identifies the lost worker and reason:
+<code>killed</code>, <code>replaced</code>, or <code>exited</code>.</li>
+</ul>
+<p>Reconnect with <code>Last-Event-ID</code> (or <code>?since=</code>; the header
+wins). Retained events after that ID are replayed, not consumed. IDs combine a
+daemon epoch and sequence; deduplicate them. Invalid cursors return JSON 400,
+a changed epoch or future cursor returns 409, an evicted cursor returns 410.
+An open stream that falls behind receives <code>event: reset</code> and closes.</p>
+<p>Replay is bounded to 256 events / 8 MiB by default, not durable or exactly-once.
+Configure <code>PYTHOND_MAX_EVENTS</code> / <code>PYTHOND_MAX_EVENT_BYTES</code>.
+Output snapshots contain at most the last 64 KiB of UTF-8 text; when truncated,
+fetch the full result from the receipt's <code>Location</code>. Poll results
+become eligible for eviction 300 seconds after completion, not launch. Replay
+retention is independent of that TTL.</p>
+<p>Disconnecting or reloading a client never cancels Python work. Daemon shutdown
+closes streams; a restart loses sessions and changes the epoch and TCP token.
+Adapters must persist their own cursor and job ownership, match the receipt's
+<code>X-Pythond-Session-Id</code> plus cell ID, buffer completions that precede
+the receipt, and deliver only to the owning conversation. Reconcile gaps with
+<code>poll</code> where possible; never blindly resubmit code after a lost reply.</p>
 
 <h2>Objects move as pickles</h2>
 
@@ -190,7 +243,8 @@ in the shared namespace. Ctrl-D detaches; the session stays alive
 <h2>Commands</h2>
 
 <pre>
-pysh new &lt;name&gt;              create session
+pysh new &lt;name&gt;              create; refuse an existing name
+pysh new &lt;name&gt; --replace    explicitly discard existing state and replace
 pysh run &lt;name&gt; "code"       sync exec, raw output
 pysh run &lt;name&gt; @task.py     post a file's contents as the cell
 pysh fire &lt;name&gt; "code"      async thread, shares namespace (can't kill C code)
@@ -209,6 +263,12 @@ pyctl start [--show-token]   start daemon in foreground
 pyctl stop                   stop daemon
 pyctl status                 daemon liveness
 </pre>
+
+<h2>Auto-checkpoint</h2>
+<p>Successful synchronous cells and successful async completions are appended
+to <code>~/.pythond/sessions/&lt;name&gt;/history.py</code>. Async checkpointing
+requires neither a subscriber nor a <code>poll</code> request. Errors are not
+checkpointed. History contains source, not a saved copy of live connections.</p>
 
 <h2>Security</h2>
 
