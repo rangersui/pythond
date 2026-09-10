@@ -11,11 +11,11 @@ pysh run work "x = 42"   # sets x
 pysh run work "x + 1"    # 43 (x survived)
 ```
 
-Variables, connections, threads persist between calls.
-No terminal parsing. No ANSI. exec() semantics.
+Variables, connections, threads persist between calls. Output is plain
+captured text with exec() semantics.
 
 `pysh` is your function-call surface into that persistent process: source code
-in, captured output out. Do not treat it as a terminal transcript.
+in, captured output out.
 
 ## Mental Model
 
@@ -44,8 +44,8 @@ Keep state in the Python namespace when you will need it again:
 - live decisions such as blocked IPs, feature flags, rate limits, and routing
   weights.
 
-Do not reopen or recompute these on every turn unless the task requires a fresh
-state. Read, patch, and inspect them by name in later cells.
+Read, patch and inspect them by name in later cells; recompute only when the
+task needs fresh state.
 
 Run host commands from inside the session when their output is part of the task:
 
@@ -61,14 +61,12 @@ pythond daemon          # start daemon (foreground)
 pysh new work           # create a persistent session
 ```
 
-If daemon is not running, start it first. One daemon manages all sessions.
+`pythond daemon` starts the daemon. One daemon manages all sessions.
 Each session is an isolated subprocess with its own namespace.
 
-`new` never replaces an existing session by default: it returns a conflict and
-preserves live state, including under concurrent calls. Inspect `ls` / `status`
-to decide whether it is yours to reuse. Only use `pysh new work --replace`
-when discarding that session's variables, connections, and browser state is
-explicitly intended. Never automatically escalate a conflict to replacement.
+`new` creates the session and returns `201`; if the name exists it returns
+`409` and leaves the existing state as it is. `pysh new work --replace`
+discards the existing session and creates a fresh one.
 
 `pyctl start` is an alias for `pythond daemon`. Prefer `pythond daemon` in
 agent workflows; use `pyctl` for stop/status.
@@ -76,8 +74,8 @@ agent workflows; use `pyctl` for stop/status.
 ## Core Commands
 
 ```bash
-pysh new <name>              # create; refuse an existing name
-pysh new <name> --replace    # explicitly discard existing state and replace
+pysh new <name>              # create session (409 if the name exists)
+pysh new <name> --replace    # replace an existing session
 pysh run <name> "code"       # sync exec/eval, raw output
 pysh fire <name> "code"      # async thread, shared namespace
 pysh fork <name> "code"      # async process, POSIX only, killable
@@ -93,8 +91,8 @@ pysh cp <src> <dst>          # copy pickled objects (scp syntax)
 ```
 
 Session names are canonical lowercase: `a-z`, `0-9`, `_`, or `-`, 1-80
-characters. Names with uppercase letters or dots are rejected. Windows device
-names such as `con`, `nul`, `prn`, `aux`, `com1`, and `lpt1` are also rejected.
+characters. Uppercase, dots and Windows device names (`con`, `nul`, `prn`,
+`aux`, `com1`, `lpt1`) are rejected.
 
 ## run, fire, fork
 
@@ -115,9 +113,10 @@ pysh run work "model.score(X_test)"   # model is there
 
 Use `fork` for slow or risky work that should be killable. It runs in a child
 process and pickles new or reassigned variables back into the parent namespace.
-Unpicklable objects (sockets, locks, CUDA tensors) are skipped. In-place
-mutations (`list.append`, `dict[k]=v`) won't merge -- use assignment
-(`x = new_value`). Failed forks do not merge.
+Unpicklable objects (sockets, locks, CUDA tensors) are skipped. A name
+merges back when the child reassigns it (`x = new_value`); in-place mutation
+of an existing object stays in the child. A failed fork leaves the parent
+namespace unchanged.
 
 ```bash
 pysh fork work "results = expensive_search(params)"
@@ -128,8 +127,9 @@ pysh int work                # kills fork'd process
 `fire` cells in one session run serially under the session lock. Use multiple
 sessions for real parallelism.
 
-Long `run` cells: the command channel times out at 30s and the session must
-then be killed. Anything that might exceed that goes through `fire` or `fork`.
+`run` waits 30 seconds for the reply. A cell that runs longer keeps running,
+but the channel is then out of sync and the way on is `kill` then `new`.
+Anything that might take longer goes through `fire` or `fork`.
 
 ## State Persists
 
@@ -147,7 +147,7 @@ Connections, threads, servers -- anything in the namespace -- stay alive:
 pysh run work "import sqlite3; db = sqlite3.connect('app.db')"
 # ... 100 turns later ...
 pysh run work "db.execute('SELECT count(*) FROM users').fetchone()"
-# (42,)   (same connection, never closed)
+# (42,)   (same connection)
 ```
 
 ## File Loading
@@ -200,13 +200,13 @@ destination session.
 | `ls`                     | text listing                                   |
 | `new`, `kill`, `int` | text confirmation or error                     |
 
-Errors in `run` return traceback text (and exit code 1) but do not kill the
-session.
+An error in `run` returns the traceback with exit code 1; the session keeps
+running.
 
 ## Remote Sessions
 
-Remote access is ssh. The state lives in the remote daemon, not in the
-connection, so one-shot calls are enough:
+Remote access is ssh. The state lives in the remote daemon, so one-shot
+calls are enough:
 
 ```bash
 ssh server pysh run work "x = 42"
@@ -241,28 +241,26 @@ curl --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock \
      --data-binary '1 + 1' http://pythond/run/work    # -> 2
 ```
 
-Python source goes in the request body, raw -- never JSON-escaped. Send
-`Content-Length` in UTF-8 bytes; chunked request bodies are not supported.
-Native adapters can use HTTP directly instead of spawning the CLI per call.
+Python source goes in the request body, raw. `Content-Length` counts UTF-8
+bytes. Adapters can speak HTTP directly instead of spawning the CLI per call.
 
-`new` returns **201 Created**, or **409** if the name exists. Only `?replace=1`
-permits replacement. `fire` / `fork` return **202 Accepted** with a JSON receipt
-and `Location: /poll/<name>?cell=<id>`. That header locates the status monitor
-without parsing the body. Accept **2xx**, not only `200`. The HTTP API and SSE
-wire protocol are documented in the README.
+`new` returns `201`, or `409` if the name exists; `?replace=1` replaces.
+`fire` / `fork` return `202` with a JSON receipt and
+`Location: /poll/<name>?cell=<id>`. Treat any `2xx` as success. The README
+documents the HTTP API and the SSE stream.
 
 ## Security Model
 
 Treat pythond like SSH into a Python runtime.
 
-- Not a sandbox: code runs with the daemon user's OS permissions.
-- Once connected, a client has full access to all sessions; there is no
-  per-session permission isolation.
+- Code runs with the daemon user's OS permissions.
+- A connected client has full access to all sessions, the same as a login
+  shell.
 - Local POSIX uses a unix socket with file permissions.
 - Local Windows uses loopback TCP plus a bearer token in
   `%LOCALAPPDATA%\pythond\daemon.json`.
-- The daemon never binds a non-loopback address; remote exposure is ssh's (or
-  a reverse proxy's) job.
+- The daemon binds only the unix socket or 127.0.0.1; ssh or a reverse proxy
+  carries remote access.
 
 Runtime files and durable state are separate:
 
@@ -285,27 +283,31 @@ Runtime files and durable state are separate:
 
 ## Async Rules
 
-`fire` cells in one session execute serially under the session lock. Use
-multiple sessions for parallel execution.
+`fire` cells in one session execute serially. Use multiple sessions for
+parallel execution. While a cell is running, `run`, `vars`, `complete`,
+pickle and the fork snapshot return `409 busy` at once and the refused code
+is discarded; `status`, `poll` and `int` keep working (`status` shows
+`vars: null` meanwhile). One command is in flight per worker at a time; a
+second one also gets `409 busy`. Long work goes through `fire`; write
+progress and checkpoints to files.
 
-For agent adapters, prefer authenticated **`GET /events` (SSE)** over a polling
-loop. Subscribe before firing; completion is pushed by the worker, not found by
-a timer. Persist job ownership and the last processed event ID outside Python.
-Match `session_id` + `cell_id` to the owning conversation; the HTTP receipt's
-`X-Pythond-Session-Id` identifies the worker. Buffer completions that arrive
-before the receipt, and deduplicate replayed event IDs. Never broadcast a
-completion to whichever conversation happens to be active.
+For agent adapters, subscribe to `GET /events` (SSE) before firing and let the
+completion event wake the conversation. Key each job by `X-Pythond-Session-Id`
+(from the receipt) plus `cell_id`, persist that and the last event id outside
+Python, and keep completions that arrive before their receipt until the
+receipt lands.
 
-Resume with `Last-Event-ID`. A `ready` event establishes the initial cursor;
-`cell_done` carries output/error, and `session_closed` reports worker loss.
-Replay is bounded (256 events / 8 MiB), not durable across daemon restarts.
-An expired cursor returns 410 (or `reset` on an open stream); a changed epoch
-returns 409. Reconcile with `poll` where possible; never automatically rerun
-code whose acceptance is uncertain. Closing the stream does not cancel work.
-
-Completion output is a UTF-8 tail of at most 64 KiB. If `output_truncated` is
-true, use the receipt's `Location` to fetch the full result while retained.
-Poll results are eligible for eviction 300s after **completion**, not launch.
+Events: `ready` (initial cursor), `session_created` (session, session_id, pid),
+`cell_done` (output tail of 64 KiB, `error`, `sync`, `code_head` = first 512
+bytes of source) and `session_closed` (reason). The retained three carry a
+`timestamp` in Unix seconds. `run` completions have `sync: true`
+and correlate with the `X-Pythond-Cell-Id` header of the executed `run`;
+their full output is the HTTP reply. `fire` /
+`fork` completions have `sync: false`; their full output is at the receipt's
+`Location` for 300 seconds after completion. Resume with `Last-Event-ID`; an
+evicted cursor returns 410 (`reset` on an open stream), a changed epoch 409.
+The log holds 256 events / 8 MiB for the daemon's lifetime. After a lost
+reply, `poll` the job before deciding anything.
 
 `pysh poll <session> <cell_id>` reads a specific cell.
 `pysh poll <session>` reads the most recent cell, or `{"status":"idle"}` if
@@ -313,10 +315,11 @@ none exist.
 
 `fork` cells run in a child process. New/changed variables are pickled back
 and merged when done. Unpicklable objects (sockets, locks, CUDA tensors) are
-skipped. In-place mutations (`list.append`, `dict[k]=v`) won't merge -- use
-assignment (`x = new_value`). Failed forks do not merge. Merge is
-last-writer-wins: a finished fork can overwrite a variable that the parent
-changed while the fork was running.
+skipped. A name merges back when the child reassigns it (`x = new_value`);
+in-place mutation of an existing object stays in the child. A failed fork
+leaves the parent namespace unchanged. Merge is last-writer-wins: a finished
+fork can overwrite a variable that the parent changed while the fork was
+running.
 
 ## Session Lifecycle
 
@@ -328,25 +331,20 @@ crashes, create a new one with the same name and replay.
 
 Successful synchronous `run` cells are appended to
 `~/.pythond/sessions/<name>/history.py`. Successful async `fire`/`fork` cells
-are appended on completion, without requiring `poll` or a subscriber.
-If a session dies, replay:
+are appended on completion. If a session dies, replay:
 `pysh run <name> "exec(open(...).read())"`.
 
-Like shell history under SSH, pythond session history and live namespaces can
-expose secrets. `history.py` may contain executed Python source. Variables
-assigned in a session remain in that live Python process until overwritten or
-the session is killed. Do not paste API keys, passwords, tokens, or other
-secrets into cells unless you are willing for them to persist in that session
-and its local files.
+Like shell history under SSH, `history.py` holds executed source and the live
+process holds assigned values until they are overwritten or the session is
+killed. A secret pasted into a cell persists in both.
 
-## Avoid
+## Rules
 
-- Do not parse ANSI escape sequences; output is already clean text.
-- Do not use `pysh` as a terminal transcript.
-- Do not put Python source inside JSON; send source as the request body or load
-  it from a file.
-- Do not move task state back into the host shell once a session exists.
-- Do not run cells that may exceed 30s through `run`; use `fire`/`fork`.
+- Output is plain text; read it as is.
+- `pysh` is a function call: source in, captured output out.
+- Source goes in the request body or an `@file`.
+- Once a session exists, task state lives in it.
+- Cells that may exceed 30s go through `fire` or `fork`.
 
 ## References
 

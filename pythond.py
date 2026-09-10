@@ -17,13 +17,13 @@ Everything in this file is that loop plus delivery:
   4. fire / fork                 -- async cells: thread (shares ns) / process (killable)
   5. local HTTP                  -- one-shot CLI calls reach the live process
 
-Transport is borrowed, never built:
+Transport is borrowed:
 
   local POSIX    HTTP over AF_UNIX socket -- fs permissions are the auth
   local Windows  HTTP over 127.0.0.1 + bearer token (%LOCALAPPDATA%\\pythond)
   remote         ssh host pysh run work "code"   (ssh ControlMaster for latency;
                  state lives in the remote daemon, not in the connection)
-  TLS            nginx / caddy / ssh -L, if a TCP port must exist at all
+  TLS            nginx / caddy in front of the loopback port, or ssh -L
   attach         pysh attach = client-side line REPL on the same channel;
                  remote humans: ssh -t host pysh attach work
 
@@ -33,8 +33,8 @@ The debug client is curl:
        --data-binary '1 + 1' http://pythond/run/work
 
 Commands (pysh):
-    pysh new <name>              create; refuse an existing name
-    pysh new <name> --replace    explicitly discard and replace an existing session
+    pysh new <name>              create session (409 if the name exists)
+    pysh new <name> --replace    replace an existing session
     pysh run <name> "code"       sync eval/exec, raw output
     pysh fire <name> "code"      async thread -- shares namespace, can't kill C
     pysh fork <name> "code"      async process (POSIX only) -- killable, pickles vars back
@@ -54,7 +54,7 @@ Daemon (pyctl / pythond):
 HTTP API (what pysh speaks; curl speaks it too):
     GET  /ls                     text listing
     POST /new/<name>             201 Created; 409 if name exists
-    POST /new/<name>?replace=1   201 Created; explicitly discard and replace
+    POST /new/<name>?replace=1   201 Created; replaces an existing session
     POST /run/<name>   body=code raw output; X-Pythond-Exec-Error: 1 on traceback
     POST /fire/<name>  body=code 202 Accepted; JSON cell_id + Location: /poll/...
     POST /fork/<name>  body=code 202 Accepted; JSON cell_id + Location: /poll/...
@@ -69,23 +69,23 @@ HTTP API (what pysh speaks; curl speaks it too):
     404 = no such session/route, 409 = conflict, 401 = bad token.
 
 Security (same model as SSH):
-  Not a sandbox: code runs with the daemon user's OS permissions.
-  The daemon only ever binds an AF_UNIX socket or 127.0.0.1.  There is no
-  network listener to harden; exposure is ssh's (or your reverse proxy's) job.
+  Code runs with the daemon user's OS permissions.  The daemon binds only an
+  AF_UNIX socket or 127.0.0.1; ssh or a reverse proxy carries remote access.
 
 Auto-checkpoint:
   ~/.pythond/sessions/<name>/history.py -- successful sync execs, plus async
-  execs on completion (no poll required); replayable with exec(open(...).read()).
+  execs on completion; replayable with exec(open(...).read()).
   History can contain secrets you paste into cells; treat it like shell history.
 
 fire vs fork:
     fire = threading.Thread.  Shares namespace -- fire'd code can set variables
-    that later calls read.  Cannot be killed when stuck in C code.
-    Exec is serialized (one cell at a time) -- async to the client, not parallel.
+    that later calls read.  A cell stuck in C code ends with pysh kill.
+    Cells run one at a time: async to the client, serial in the session.
     fork = os.fork() child process (POSIX only).  COW copy of namespace.
     Killable (SIGKILL).  New/changed vars are pickled back and merged.
     Unpicklable objects (sockets, locks, CUDA tensors) are skipped.
-    In-place mutations (list.append, dict[k]=v) won't merge -- use assignment.
+    A name merges back when the child reassigns it (x = new_value); in-place
+    mutation of an existing object stays in the child.
     Merge is last-writer-wins: a completed fork may overwrite variables changed
     in the parent while the fork was running.
 """
@@ -338,7 +338,7 @@ def _eval_exec_cell(src: str, ns: JsonDict) -> None:
 def _make_exec(
     ns: JsonDict,
     lock: threading.Lock,
-) -> typing.Callable[[str], _ExecOutput]:
+) -> typing.Callable[..., _ExecOutput]:
     """Build _exec(src): eval/exec in ns and return captured output.
 
     Uses _ThreadStdout for thread-safe capture: the exec thread's output goes
@@ -357,8 +357,8 @@ def _make_exec(
     sys.stdout = stdout_wrapper
     sys.stderr = stderr_wrapper
 
-    def _exec(src: str) -> _ExecOutput:
-        with lock:
+    def _exec(src: str, *, wait: bool = True) -> _ExecOutput:
+        with _locked(lock, wait=wait):
             buf = io.StringIO()
             had_error = False
             sys.stdout = stdout_wrapper
@@ -410,17 +410,25 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[n:]
 
 
+class _SessionBusy(RuntimeError):
+    """Ordinary admission refusal, never a command-channel failure."""
+
+
 @contextlib.contextmanager
-def _locked(lock: threading.Lock | None) -> typing.Iterator[None]:
+def _locked(lock: threading.Lock | None, *, wait: bool = True) -> typing.Iterator[None]:
     if lock is None:
         yield
     else:
-        with lock:
+        if not lock.acquire(blocking=wait):
+            raise _SessionBusy("session busy: execution or command in progress")
+        try:
             yield
+        finally:
+            lock.release()
 
 
 def _public_names(ns: JsonDict, lock: threading.Lock | None) -> list[str]:
-    with _locked(lock):
+    with _locked(lock, wait=False):
         return [v for v in ns if not v.startswith("_")]
 
 
@@ -457,13 +465,16 @@ def _kill_running_fork_pgids(cells: dict[str, JsonDict]) -> int:
 
 
 def _notify_done(notify: typing.Callable[[JsonDict], None] | None,
-                 cid: str, result: JsonDict) -> None:
+                 cid: str, result: JsonDict, *, sync: bool = False,
+                 code: str = "") -> None:
     """Publish a bounded completion snapshot, outside the cell/exec locks."""
     if notify is None:
         return
     raw = str(result["output"]).encode("utf-8", "replace")
     limit = min(_EVENT_OUTPUT_BYTES, max(0, _MAX_WORKER_RESPONSE // 16))
     event = {"type": "cell_done", "cell_id": cid, "status": "done",
+             "sync": sync,
+             "code_head": code.encode("utf-8", "replace")[:512].decode("utf-8", "ignore"),
              "error": bool(result.get("_error")),
              "output": raw[-limit:].decode("utf-8", "ignore") if limit else "",
              "output_bytes": len(raw), "output_truncated": len(raw) > limit}
@@ -480,7 +491,22 @@ def _notify_done(notify: typing.Callable[[JsonDict], None] | None,
 def _dispatch(
     cmd: str,
     args: list[str],
-    _exec: typing.Callable[[str], _ExecOutput],
+    _exec: typing.Callable[..., _ExecOutput],
+    cells: dict[str, JsonDict],
+    ns: JsonDict,
+    lock: threading.Lock | None = None,
+    notify: typing.Callable[[JsonDict], None] | None = None,
+) -> JsonDict:
+    try:
+        return _dispatch_command(cmd, args, _exec, cells, ns, lock, notify)
+    except _SessionBusy as e:
+        return {"error": str(e), "busy": True}
+
+
+def _dispatch_command(
+    cmd: str,
+    args: list[str],
+    _exec: typing.Callable[..., _ExecOutput],
     cells: dict[str, JsonDict],
     ns: JsonDict,
     lock: threading.Lock | None = None,
@@ -491,8 +517,11 @@ def _dispatch(
     if cmd in ("run", "fire", "fork") and not args:
         return {"error": f"{cmd} requires code"}
     if cmd == "run":
-        out = _exec(args[0])
-        return {"output": str(out), "_error": bool(getattr(out, "error", False))}
+        out = _exec(args[0], wait=False)
+        result = {"output": str(out), "_error": bool(getattr(out, "error", False))}
+        cid = uuid.uuid4().hex[:12]
+        _notify_done(notify, cid, result, sync=True, code=args[0])
+        return {**result, "cell_id": cid}
     elif cmd == "fire":
         # threading.Thread: shares the session namespace, so fire'd code can
         # set variables later calls read.  Tradeoff: threads can't be
@@ -522,7 +551,7 @@ def _dispatch(
                     r["status"] = "done"
                     r["_done_at"] = time.time()
                     r["tid"] = None
-                _notify_done(notify, cid, r)
+                _notify_done(notify, cid, r, code=args[0])
         t = threading.Thread(target=_bg, daemon=True)
         with _cells_lock:
             t.start()
@@ -563,7 +592,8 @@ def _dispatch(
             # Snapshot and fork under the same lock so the diff base and child
             # image match.
             if lock:
-                lock.acquire()
+                if not lock.acquire(blocking=False):
+                    raise _SessionBusy("session busy: execution in progress")
                 fork_locked = True
             ns_snap = {k: id(v) for k, v in ns.items()}
             child_pid = os.fork()
@@ -719,7 +749,7 @@ def _dispatch(
                     r["_skipped"] = skipped
                     r["status"] = "done"
                     r["_done_at"] = time.time()
-                _notify_done(notify, cid, r)
+                _notify_done(notify, cid, r, code=args[0])
         with _cells_lock:
             cells[cid] = res
             _evict_stale_cells(cells)
@@ -805,7 +835,10 @@ def _dispatch(
             resp["skipped"] = r["_skipped"]
         return resp
     elif cmd == "status":
-        vs = len(_public_names(ns, lock))
+        try:
+            vs = len(_public_names(ns, lock))
+        except _SessionBusy:
+            vs = None  # Unknown while executing; do not read a mutating namespace.
         with _cells_lock:
             _evict_stale_cells(cells)
             running = [cid for cid, r in cells.items()
@@ -820,7 +853,7 @@ def _dispatch(
         # the session.  Same per-var probe as the fork merge: unpicklable
         # values (sockets, locks, modules) are skipped and reported.
         var = args[0] if args else ""
-        with _locked(lock):
+        with _locked(lock, wait=False):
             if var:
                 if var not in ns:
                     return {"error": f"name '{var}' is not defined"}
@@ -851,11 +884,12 @@ def _dispatch(
         var = args[0] if args else ""
         if len(args) < 2:
             return {"error": "load requires pickled data"}
-        try:
-            obj = pickle.loads(base64.b64decode(args[1]))
-        except Exception as e:
-            return {"error": f"unpickle failed: {e.__class__.__name__}"}
-        with _locked(lock):
+        with _locked(lock, wait=False):
+            # Admission precedes unpickling, which itself can execute user code.
+            try:
+                obj = pickle.loads(base64.b64decode(args[1]))
+            except Exception as e:
+                return {"error": f"unpickle failed: {e.__class__.__name__}"}
             if var:
                 ns[var] = obj
                 return {"set": [var]}
@@ -868,7 +902,7 @@ def _dispatch(
     elif cmd == "complete":
         import rlcompleter
         text = args[0] if args else ""
-        with _locked(lock):
+        with _locked(lock, wait=False):
             ns_snapshot = dict(ns)
         c = rlcompleter.Completer(ns_snapshot)
         matches: list[str] = []
@@ -997,7 +1031,8 @@ class _EventLog:
             return after
 
     def publish(self, event: JsonDict) -> None:
-        payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+        # Stable across replay; wall-clock seconds for activity UIs, not ordering.
+        payload = json.dumps({**event, "timestamp": time.time()}, ensure_ascii=False).encode("utf-8")
         with self._cv:
             if self.closed:
                 return
@@ -1046,6 +1081,9 @@ def _publish_session(name: str, s: JsonDict, *, replace: bool = False) -> None:
             raise RuntimeError(f"too many sessions (max {_MAX_SESSIONS})")
         old = sessions.get(name)
         sessions[name] = s
+        # Publish while ownership is locked: commands cannot precede creation.
+        _events.publish({"type": "session_created", "session": name,
+                         "session_id": s["id"], "pid": s["proc"].pid})
     if old is not None and old is not s:
         _close_session(old)
         _session_closed(name, old, "replaced")
@@ -1146,56 +1184,74 @@ def _close_session(s: JsonDict) -> None:
 
 
 def kill_session(name: str) -> bool:
+    return _kill_session(name) is not None
+
+
+def _kill_session(name: str) -> JsonDict | None:
+    """Return the exact removed worker, never re-resolve a reused name."""
     with _sessions_lock:
         s = sessions.pop(name, None)
     if s is None:
-        return False
+        return None
     _close_session(s)
     _session_closed(name, s, "killed")
-    return True
+    return s
 
 
 def send_session(name: str, cmd: str, args: list[str],
                  timeout: float = _SEND_TIMEOUT) -> JsonDict:
     """Send one command to a session worker and wait for its response.
-    A per-session lock serializes concurrent callers, so an aborted client
-    cannot desynchronize the request/response channel."""
+    Only one command may be in flight per worker. Contending callers receive
+    busy immediately; an aborted client cannot desynchronize the reply channel."""
     s = _get_session(name)
     if s is None:
         return {"error": f"no session '{name}' -- create it first: new {name}"}
-    with s["lock"]:
-        if _get_session(name) is not s:
-            return {"error": f"no session '{name}'"}
-        if s["unhealthy"]:
-            return {"error": f"session '{name}' command channel out of sync "
-                             f"after timeout; use kill {name}"}
-        proc = s["proc"]
-        try:
-            assert proc.stdin is not None
-            proc.stdin.write(json.dumps({"cmd": cmd, "args": args}) + "\n")
-            proc.stdin.flush()
-        except (OSError, ValueError):
-            return {"error": f"session '{name}' dead -- new {name} to restart"}
-        try:
-            line = s["q"].get(timeout=timeout)
-        except queue.Empty:
-            s["unhealthy"] = True
-            return {"error": "timeout -- command channel may be out of sync; "
-                             f"use int {name} or kill {name} if stuck"}
-        if line is None:
-            return {"error": f"session '{name}' dead -- new {name} to restart"}
-        if len(line) > _MAX_WORKER_RESPONSE:
-            s["unhealthy"] = True
-            return {"error": f"worker response too large; use kill {name} to restart"}
-        try:
-            resp = typing.cast(JsonDict, json.loads(line))
-        except json.JSONDecodeError:
-            s["unhealthy"] = True
-            return {"error": f"malformed worker response; use kill {name} to restart"}
-        if cmd in ("fire", "fork") and resp.get("cell_id"):
-            _note_async_launch(name, s, args[0], resp)
-        resp["_session_id"] = s["id"]  # Bind HTTP receipts to the worker actually used.
-        return resp
+    try:
+        with _locked(s["lock"], wait=False):
+            resp = _send_session_locked(name, s, cmd, args, timeout)
+    except _SessionBusy as e:
+        resp = {"error": str(e), "busy": True}
+    resp["_session_id"] = s["id"]
+    return resp
+
+
+def _send_session_locked(name: str, s: JsonDict, cmd: str, args: list[str],
+                         timeout: float) -> JsonDict:
+    # Called only with the per-worker command lock held. Real transport failures
+    # remain sticky; ordinary contention never sends a request or poisons it.
+    if _get_session(name) is not s:
+        return {"error": f"no session '{name}'"}
+    if s["unhealthy"]:
+        return {"error": f"session '{name}' command channel out of sync "
+                         f"after transport failure; use kill {name}"}
+    proc = s["proc"]
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({"cmd": cmd, "args": args}) + "\n")
+        proc.stdin.flush()
+    except (OSError, ValueError):
+        return {"error": f"session '{name}' dead -- new {name} to restart"}
+    try:
+        line = s["q"].get(timeout=timeout)
+    except queue.Empty:
+        s["unhealthy"] = True
+        return {"error": "timeout -- command channel may be out of sync; "
+                         f"use kill {name} if stuck (accepted code may still run)"}
+    if line is None:
+        return {"error": f"session '{name}' dead -- new {name} to restart"}
+    if len(line) > _MAX_WORKER_RESPONSE:
+        s["unhealthy"] = True
+        return {"error": f"worker response too large; use kill {name} to restart"}
+    try:
+        resp = json.loads(line)
+        if not isinstance(resp, dict):
+            raise ValueError("response must be an object")
+    except (ValueError, TypeError):
+        s["unhealthy"] = True
+        return {"error": f"malformed worker response; use kill {name} to restart"}
+    if cmd in ("fire", "fork") and resp.get("cell_id"):
+        _note_async_launch(name, s, args[0], resp)
+    return resp
 
 
 def _list_sessions() -> str:
@@ -1239,6 +1295,9 @@ def _worker_event(name: str, s: JsonDict, event: JsonDict) -> None:
         return
     if _get_session(name) is not s:
         return
+    if event.get("sync") is True:
+        _events.publish({**event, "session": name, "session_id": s["id"]})
+        return  # Sync completions have no asynchronous receipt to pair with.
     cid = event["cell_id"]
     with s["async_lock"]:
         src = s["async_src"].pop(cid, None)
@@ -1267,6 +1326,13 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
                     body_bytes: bytes) -> tuple[int, dict[str, str], str | bytes]:
     """Execute one HTTP command.  Returns (status, extra_headers, body)."""
     headers: dict[str, str] = {}
+
+    def bind_identity(resp: JsonDict) -> None:
+        headers.pop("X-Pythond-Session-Id", None)
+        session_id = resp.pop("_session_id", None)
+        if session_id is not None:
+            headers["X-Pythond-Session-Id"] = session_id
+
     body = body_bytes.decode("utf-8", "replace")
     if cmd == "ls" and method == "GET":
         return 200, headers, _list_sessions()
@@ -1284,6 +1350,9 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         _validate_session_name(name)
     except ValueError:
         return 400, headers, f"ERR invalid session name. {_SESSION_NAME_RULE}"
+    observed = _get_session(name)
+    if observed is not None:
+        headers["X-Pythond-Session-Id"] = observed["id"]
     if cmd == "new" and method == "POST":
         policy = query.get("replace", ["0"])
         if policy not in (["0"], ["1"]):
@@ -1291,12 +1360,16 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         try:
             s = new_session(name, replace=policy == ["1"])
         except (ValueError, RuntimeError) as e:
+            observed = _get_session(name)
+            bind_identity({"_session_id": observed["id"]} if observed else {})
             return 409, headers, f"ERR {_public_error(e)}"
         headers["Location"] = f"/status/{_quote(name)}"
         headers["X-Pythond-Session-Id"] = s["id"]
         return 201, headers, f"OK {name} pid={s['proc'].pid}"
     if cmd == "kill" and method == "POST":
-        if kill_session(name):
+        removed = _kill_session(name)
+        bind_identity({"_session_id": removed["id"]} if removed else {})
+        if removed is not None:
             return 200, headers, f"OK killed {name}"
         return 404, headers, f"ERR no session '{name}'"
     if cmd == "pickle":
@@ -1308,6 +1381,7 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
             return 400, headers, "ERR invalid variable name"
         if method == "GET":
             resp = send_session(name, "dump", [var])
+            bind_identity(resp)
             if "error" in resp:
                 msg = str(resp["error"])
                 return _session_error_status(msg), headers, f"ERR {msg}"
@@ -1318,6 +1392,7 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         resp = send_session(
             name, "load",
             [var, base64.b64encode(body_bytes).decode("ascii")])
+        bind_identity(resp)
         if "error" in resp:
             msg = str(resp["error"])
             return _session_error_status(msg), headers, f"ERR {msg}"
@@ -1335,9 +1410,7 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         if cell:
             args = [cell]
     resp = send_session(name, cmd, args)
-    session_id = resp.pop("_session_id", None)
-    if session_id is not None:
-        headers["X-Pythond-Session-Id"] = session_id
+    bind_identity(resp)
 
     if "error" in resp and "_error" not in resp:
         msg = str(resp["error"])
@@ -1345,6 +1418,8 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
 
     exec_error = bool(resp.pop("_error", False))
     if cmd == "run":
+        if resp.get("cell_id"):
+            headers["X-Pythond-Cell-Id"] = resp["cell_id"]
         output = str(resp.get("output", ""))
         if not exec_error and body.strip():
             _log_history(name, body)

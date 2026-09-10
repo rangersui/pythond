@@ -8,6 +8,7 @@ AF_UNIX socket on POSIX, 127.0.0.1 + token on Windows -- both paths are
 exercised by CI's OS matrix.
 """
 import json
+import pickle
 import io
 import contextlib
 import os
@@ -501,6 +502,10 @@ def test_dispatch_fork_concurrent_fire():
     time.sleep(0.1)
     resp = pythond._dispatch("fork", ["forked_val = base + 2"],
                              _exec, cells, ns, lock)
+    check("fork snapshot refuses busy execution lock", resp.get("busy") is True)
+    time.sleep(0.6)
+    resp = pythond._dispatch("fork", ["forked_val = base + 2"],
+                             _exec, cells, ns, lock)
     cid = resp["cell_id"]
     for _ in range(20):
         time.sleep(0.2)
@@ -589,6 +594,7 @@ def _fake_session(lines=None):
     for line in (lines or []):
         q.put(line)
     proc = mock.Mock()
+    proc.pid = 12345
     proc.stdin = _FakeStdin()
     proc.poll.return_value = None
     return {"proc": proc, "q": q, "lock": threading.Lock(),
@@ -1090,19 +1096,27 @@ def test_worker_subprocess_protocol():
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=env, text=True, encoding="utf-8", bufsize=1,
     )
+    activity = []
+    def read_reply():
+        while True:
+            packet = json.loads(proc.stdout.readline())
+            if "_event" in packet:
+                activity.append(packet["_event"])
+            else:
+                return packet
     try:
-        ready = json.loads(proc.stdout.readline())
+        ready = read_reply()
         check("worker ready handshake", ready.get("ready") is True, ready)
 
         proc.stdin.write("{bad json\n")
         proc.stdin.flush()
-        resp = json.loads(proc.stdout.readline())
+        resp = read_reply()
         check("bad json gets protocol error",
               resp == {"error": "worker protocol error"}, resp)
 
         proc.stdin.write(json.dumps({"cmd": "run", "args": ["x = 42"]}) + "\n")
         proc.stdin.flush()
-        resp = json.loads(proc.stdout.readline())
+        resp = read_reply()
         check("worker run ok", resp.get("_error") is False, resp)
 
         # stray output must not corrupt the protocol stream: a thread that
@@ -1113,22 +1127,21 @@ def test_worker_subprocess_protocol():
                 "t.start()")
         proc.stdin.write(json.dumps({"cmd": "run", "args": [code]}) + "\n")
         proc.stdin.flush()
-        resp = json.loads(proc.stdout.readline())
+        resp = read_reply()
         check("stray-print cell ok", resp.get("_error") is False, resp)
         time.sleep(0.5)
         proc.stdin.write(json.dumps({"cmd": "run", "args": ["x + 1"]}) + "\n")
         proc.stdin.flush()
-        line = proc.stdout.readline()
-        try:
-            resp = json.loads(line)
-            check("protocol survives stray thread print",
-                  resp.get("output") == "43", resp)
-        except json.JSONDecodeError:
-            check("protocol survives stray thread print", False, line)
+        resp = read_reply()
+        check("protocol survives stray thread print",
+              resp.get("output") == "43", resp)
+        check("sync events are separately framed", len(activity) == 3 and
+              all(e.get("sync") is True for e in activity) and
+              activity[-1]["cell_id"] == resp["cell_id"])
 
         proc.stdin.write(json.dumps({"cmd": "status", "args": []}) + "\n")
         proc.stdin.flush()
-        resp = json.loads(proc.stdout.readline())
+        resp = read_reply()
         check("worker still responsive", resp.get("state") == "idle", resp)
     finally:
         proc.stdin.close()
@@ -1415,13 +1428,14 @@ class _Daemon:
 
 class _Events:
     """Blocking SSE test client: waits for pushed events, never calls poll."""
-    def __init__(self, cursor=None, path="/events"):
+    def __init__(self, cursor=None, path="/events", timeout=8):
         self.request_cursor = cursor
         self.path = path
+        self.timeout = timeout
 
     def __enter__(self):
         self.conn, token = pythond._connect()
-        self.conn.timeout = 8
+        self.conn.timeout = self.timeout
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         if self.request_cursor is not None:
             headers["Last-Event-ID"] = self.request_cursor
@@ -1436,7 +1450,8 @@ class _Events:
             "text/event-stream"))
         return self
 
-    def read(self):
+    def read(self, *, include_activity=False):
+        """Legacy async/loss view, or all activity for protocol coverage."""
         fields = {}
         while True:
             line = self.response.readline(1024 * 1024)
@@ -1451,6 +1466,10 @@ class _Events:
                               fields["data"]["cursor"] == self.cursor)
                         fields = {}
                         continue
+                    if not include_activity and (fields.get("event") == "session_created" or
+                            fields["data"].get("sync") is True):
+                        fields = {}
+                        continue
                     return fields
                 continue
             if not line.startswith(":"):
@@ -1463,6 +1482,168 @@ class _Events:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def test_busy_admission_and_identity():
+    section("busy admission, no side effects, identity on errors and removal")
+    ns = pythond._init_namespace()
+    lock = threading.Lock()
+    execute = pythond._make_exec(ns, lock)
+    cells = {}
+    notifications = []
+    with lock, mock.patch.object(pythond.pickle, "loads") as loads:
+        for cmd, args in (("run", ["unwanted = 1"]), ("vars", []),
+                          ("complete", ["os."]), ("dump", [""]),
+                          ("load", ["x", "YWJj"])):
+            before = time.monotonic()
+            resp = pythond._dispatch(cmd, args, execute, cells, ns, lock,
+                                     notify=notifications.append)
+            check(f"{cmd} busy refusal is immediate", resp.get("busy") is True and
+                  time.monotonic() - before < 1, resp)
+        check("busy load never unpickles", not loads.called)
+        status = pythond._dispatch("status", [], execute, cells, ns, lock)
+        check("status remains available with unknown vars", status.get("vars", 0) is None)
+    check("refused run neither executes nor emits completion",
+          "unwanted" not in ns and not notifications)
+    resp = pythond._dispatch("run", ["21 * 2"], execute, cells, ns, lock,
+                             notify=notifications.append)
+    check("execution usable after contention", resp["output"] == "42")
+    check("sync completion matches result", notifications[0]["sync"] is True and
+          notifications[0]["cell_id"] == resp["cell_id"] and
+          notifications[0]["code_head"] == "21 * 2")
+
+    s = _fake_session([json.dumps({"state": "idle"})])
+    with _with_session("busy_test", s):
+        with s["lock"]:
+            status, headers, body = _cmd("GET", "status", "busy_test")
+            check("daemon contention is 409 with actual incarnation", status == 409 and
+                  "busy" in body and headers.get("X-Pythond-Session-Id") == s["id"])
+            check("daemon busy neither writes nor poisons", not s["proc"].stdin.sent and
+                  not s["unhealthy"])
+        check("command usable after daemon contention",
+              pythond.send_session("busy_test", "status", [])["state"] == "idle")
+        for cmd, method in (("status", "GET"), ("pickle", "GET"), ("pickle", "POST")):
+            s["unhealthy"] = True
+            status, headers, body = _cmd(method, cmd, "busy_test")
+            check("transport failure retains identity", status == 409 and
+                  headers.get("X-Pythond-Session-Id") == s["id"])
+        newer = _fake_session()
+        with mock.patch.object(pythond, "_close_session",
+                               side_effect=lambda old: pythond._publish_session("busy_test", newer)):
+            status, headers, body = _cmd("POST", "kill", "busy_test")
+            check("kill identifies removed worker even if name is reused", status == 200 and
+                  headers.get("X-Pythond-Session-Id") == s["id"] and
+                  pythond.sessions["busy_test"] is newer)
+
+
+def test_fire_queue_preserved():
+    section("fire remains serialized without blocking the control plane")
+    ns = pythond._init_namespace()
+    gate, started = threading.Event(), threading.Event()
+    ns.update({"_gate": gate, "_started": started})
+    lock = threading.Lock()
+    execute = pythond._make_exec(ns, lock)
+    cells, output = {}, queue.Queue()
+    try:
+        one = pythond._dispatch("fire", ["_started.set(); _gate.wait(); value = 40"],
+                                execute, cells, ns, lock, output.put)
+        check("first fire owns execution", started.wait(2))
+        two = pythond._dispatch("fire", ["value += 2; print(value)"],
+                                execute, cells, ns, lock, output.put)
+        check("second fire accepted while first runs", two.get("status") == "fired")
+        check("queued fire has not executed", "value" not in ns)
+    finally:
+        gate.set()
+    done = {e["cell_id"]: e for e in (output.get(timeout=3), output.get(timeout=3))}
+    check("both queued executions complete", set(done) == {one["cell_id"], two["cell_id"]})
+    check("second execution uses first result", done[two["cell_id"]]["output"] == "42" and
+          done[two["cell_id"]]["sync"] is False)
+
+
+def test_integration_activity_and_long_busy():
+    section("INTEGRATION: >30s fire, safe control plane, activity protocol and identity")
+    with tempfile.TemporaryDirectory() as td, _Daemon(td), _Events(timeout=45) as events:
+        status, headers, _ = pythond._request("POST", "/new/train")
+        sid = headers["X-Pythond-Session-Id"]
+        created = events.read(include_activity=True)
+        check("activity has publication timestamp", isinstance(created["data"].get("timestamp"), (int, float)))
+        check("created event matches successful new", status == 201 and
+              created["event"] == "session_created" and created["data"]["session_id"] == sid and
+              isinstance(created["data"]["pid"], int))
+        status, headers, _ = pythond._request("POST", "/new/train")
+        check("creation conflict identifies preserved worker", status == 409 and
+              headers.get("X-Pythond-Session-Id") == sid)
+        code = "print('你好')\n# " + "汉" * 600
+        status, headers, body = pythond._request("POST", "/run/train", code)
+        done = events.read(include_activity=True)
+        check("run preserves HTTP body and correlates completion", status == 200 and body == "你好" and
+              headers.get("X-Pythond-Cell-Id") == done["data"]["cell_id"] and
+              done["data"]["session_id"] == sid and done["data"]["sync"] is True)
+        check("code preview bounded UTF-8 prefix", len(done["data"]["code_head"].encode()) <= 512 and
+              code.startswith(done["data"]["code_head"]) and done["data"]["output"] == "你好")
+        status, headers, body = pythond._request("POST", "/run/train", "1/0")
+        failed = events.read(include_activity=True)["data"]
+        check("failed run emits synchronous error completion", status == 200 and
+              headers.get("X-Pythond-Exec-Error") == "1" and failed["error"] is True and
+              failed["sync"] is True and failed["cell_id"] != done["data"]["cell_id"])
+
+        for method, path in (("GET", "/vars/train"), ("GET", "/status/train"),
+                             ("GET", "/poll/train"), ("POST", "/complete/train"),
+                             ("POST", "/int/train")):
+            status, headers, _ = pythond._request(method, path)
+            check("all normal session commands expose identity", status == 200 and
+                  headers.get("X-Pythond-Session-Id") == sid, path)
+        for method, path, expected in (("GET", "/pickle/train/missing", 404),
+                                       ("POST", "/status/train", 405),
+                                       ("POST", "/new/train?replace=bad", 400)):
+            status, headers, _ = pythond._request(method, path)
+            check("identified session errors retain identity", status == expected and
+                  headers.get("X-Pythond-Session-Id") == sid, path)
+        marker = str(Path(td) / "training-started")
+        code = f"from pathlib import Path\nPath({marker!r}).touch()\nimport time\ntime.sleep(32)\ntrained = 42"
+        status, headers, body = pythond._request("POST", "/fire/train", code)
+        cid = json.loads(body)["cell_id"]
+        check("long training accepted with incarnation", status == 202 and
+              headers.get("X-Pythond-Session-Id") == sid)
+        check("training really started", wait_until(lambda: Path(marker).exists()))
+        for method, path, body in (("POST", "/run/train", "unwanted = 1"),
+                                   ("GET", "/vars/train", ""),
+                                   ("POST", "/complete/train", "os."),
+                                   ("GET", "/pickle/train", ""),
+                                   ("POST", "/pickle/train/x", pickle.dumps(7))):
+            before = time.monotonic()
+            status, headers, raw = pythond._request_bytes(method, path,
+                body.encode("utf-8") if isinstance(body, str) else body)
+            body = raw.decode("utf-8", "replace")
+            check("busy HTTP operation returns promptly with identity", status == 409 and
+                  "busy" in body and time.monotonic() - before < 2 and
+                  headers.get("X-Pythond-Session-Id") == sid, (path, status, body))
+        status, headers, body = pythond._request("GET", "/status/train")
+        check("status works throughout long fire", status == 200 and
+              json.loads(body)["vars"] is None and cid in json.loads(body)["running"] and
+              headers.get("X-Pythond-Session-Id") == sid)
+        status, headers, body = pythond._request("GET", f"/poll/train?cell={cid}")
+        check("poll still works after refused commands", status == 200 and
+              json.loads(body)["status"] == "running" and headers.get("X-Pythond-Session-Id") == sid)
+        done = events.read(include_activity=True)
+        check("training survives past command timeout and emits only its completion",
+              done["event"] == "cell_done" and done["data"]["cell_id"] == cid and
+              done["data"]["sync"] is False and not done["data"]["error"])
+        status, headers, body = pythond._request("POST", "/run/train", "trained, 'unwanted' in globals()")
+        check("channel and trained objects survive", status == 200 and body == "(42, False)", body)
+        events.read(include_activity=True)
+        status, headers, body = pythond._request("GET", "/pickle/train/trained")
+        check("pickle GET success has identity", status == 200 and headers.get("X-Pythond-Session-Id") == sid)
+        status, headers, body = pythond._request_bytes("POST", "/pickle/train/copied", pickle.dumps(9))
+        check("pickle POST success has identity", status == 200 and headers.get("X-Pythond-Session-Id") == sid)
+        status, headers, body = pythond._request("POST", "/kill/train")
+        closed = events.read(include_activity=True)
+        check("kill and close event identify exact removed worker", status == 200 and
+              headers.get("X-Pythond-Session-Id") == sid and closed["data"]["session_id"] == sid and
+              closed["event"] == "session_closed")
+        status, headers, body = pythond._request("GET", "/status/train")
+        check("missing worker never gets fabricated identity", status == 404 and
+              "X-Pythond-Session-Id" not in headers)
 
 
 def test_integration_safe_new():
@@ -1560,8 +1741,10 @@ def test_integration_events():
             _s, _h, text = pythond._request("POST", "/fire/work", "time.sleep(0.1); print('done')")
             cid = json.loads(text)["cell_id"]
             _s, _h, text = pythond._request("POST", "/run/work", "time.sleep(0.2); 42")
-            check("completion during locked run does not deadlock", text == "42", text)
-            check("completion during run is correctly framed", repeated.read()["data"]["cell_id"] == cid)
+            check("run refuses execution-lock contention", _s == 409 and "busy" in text, text)
+            check("completion after refused run is correctly framed", repeated.read()["data"]["cell_id"] == cid)
+            _s, _h, text = pythond._request("POST", "/run/work", "42")
+            check("busy refusal does not poison channel", _s == 200 and text == "42", text)
             check("normal notification path made no poll requests", "/poll/" not in d.stderr())
 
             _s, headers, _text = pythond._request("POST", "/fire/work", "print('汉' * 30000)")
@@ -1694,7 +1877,8 @@ def test_integration_lifecycle():
         status, _h, text = pythond._request("POST", "/run/nosuch", "1")
         check("no session 404", status == 404 and "ERR" in text, text)
 
-        # concurrent clients on one session are serialized, not interleaved
+        # Concurrent synchronous callers are admitted or refused, never queued
+        # behind an unbounded command or allowed to interleave namespace writes.
         pythond._request("POST", f"/run/{name}", "counter = 0")
         results = []
         def _concurrent():
@@ -1708,7 +1892,11 @@ def test_integration_lifecycle():
             t.join(timeout=10)
         check("concurrent clients returned", len(results) == 5, results)
         status, _h, text = pythond._request("POST", f"/run/{name}", "counter")
-        check("concurrent runs serialized", text.strip() == "5", text)
+        accepted = sum(r[0] == 200 for r in results)
+        check("concurrent runs execute exactly the admitted count",
+              accepted > 0 and text.strip() == str(accepted), (text, results))
+        check("other concurrent runs are clean busy refusals",
+              all(r[0] == 200 or (r[0] == 409 and "busy" in r[2]) for r in results))
 
         # checkpoint: successes in, errors out
         hist = os.path.join(os.path.expanduser("~"), ".pythond",
@@ -1971,6 +2159,9 @@ def main():
         test_pysh_cli_smoke,
 
         # Integration tests
+        test_busy_admission_and_identity,
+        test_fire_queue_preserved,
+        test_integration_activity_and_long_busy,
         test_integration_safe_new,
         test_integration_events,
         test_integration_event_cursors,

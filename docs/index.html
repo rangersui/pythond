@@ -48,8 +48,8 @@ while True:
 <p>Everything pythond adds is that loop plus delivery: thread-safe stdout
 capture, REPL semantics (the last expression auto-prints), one subprocess per
 named session, async cells, and local HTTP so one-shot CLI calls reach the
-live process. Transport is borrowed, never built &mdash; there is no WebSocket
-stack, no TLS stack, no PTY bridge, and no remote proxy in the codebase.</p>
+live process. Transport is borrowed: ssh carries remote calls, a reverse
+proxy terminates TLS, your terminal runs attach.</p>
 
 <h2>Quick start</h2>
 
@@ -92,9 +92,8 @@ pysh int work                              # SIGKILL the fork (POSIX)
 
 <h2>Post a file</h2>
 
-<p>Complex code with quotes, f-strings, or SQL? Post the file as the cell.
-The request body is raw Python source &mdash; never JSON-escaped, never
-shell-quoted.</p>
+<p>For code with quotes, f-strings or SQL, post the file as the cell. The
+request body is raw Python source.</p>
 
 <pre>
 cat &gt; /tmp/task.py &lt;&lt; 'EOF'
@@ -108,8 +107,8 @@ pysh run work @/tmp/task.py
 
 <h2>Remote = ssh</h2>
 
-<p>State lives in the remote daemon, not in the connection, so one-shot
-calls over ssh are enough:</p>
+<p>State lives in the remote daemon, so one-shot calls over ssh are
+enough:</p>
 
 <pre>
 ssh server pysh run work "x = 42"
@@ -118,7 +117,8 @@ ssh server pysh run work "x + 1"     # 43 (remote state)
 ssh -t server pysh attach work       # interactive
 </pre>
 
-<p>Per-call latency? That is what ssh <code>ControlMaster</code> is for:</p>
+<p>ssh <code>ControlMaster</code> holds one connection open so each call skips
+the handshake:</p>
 
 <pre>
 # ~/.ssh/config
@@ -128,8 +128,7 @@ Host server
     ControlPersist 10m
 </pre>
 
-<p>Need a TLS endpoint anyway? Terminate it with nginx or caddy in front of
-the loopback port. pythond does not ship a TLS stack.</p>
+<p>For a TLS endpoint, put nginx or caddy in front of the loopback port.</p>
 
 <h2>HTTP API</h2>
 
@@ -161,59 +160,81 @@ POST /kill/&lt;name&gt;             kill session
 POST /stop                    stop daemon
 </pre>
 
-<p><code>404</code> no such session, <code>409</code> existing name or broken
-session channel, <code>401</code> bad token. Send raw UTF-8 source with an
-explicit byte-count <code>Content-Length</code>; chunked request bodies get
+<p><code>404</code> no such session, <code>409</code> name exists / session
+busy / channel out of sync, <code>401</code> bad token. Send raw UTF-8 source
+with a byte-count <code>Content-Length</code>; chunked request bodies get
 <code>411</code>.</p>
 
-<p><code>new</code> returns <code>201 Created</code>, text confirmation, and
-<code>Location: /status/&lt;name&gt;</code>. Async calls return receipts, not
-execution results:</p>
+<p><code>new</code> returns <code>201</code>, a text confirmation and
+<code>Location: /status/&lt;name&gt;</code>. <code>fire</code> / <code>fork</code>
+return a receipt:</p>
 <pre>HTTP/1.1 202 Accepted
 Content-Type: application/json
 Location: /poll/work?cell=abc123
-X-Pythond-Session-Id: &lt;worker-incarnation&gt;
+X-Pythond-Session-Id: &lt;worker id&gt;
 
 {"cell_id": "abc123", "status": "fired"}</pre>
-<p>The <code>Location</code> header locates the status monitor without parsing
-the body (<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3">RFC
-9110 section 15.3.3</a>). Acceptance is not execution success. Clients should accept
-<b>2xx</b>, not only 200. <code>run</code> and <code>kill</code> retain their
-200 text responses.</p>
+<p><code>Location</code> is where the result appears
+(<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3">RFC 9110
+section 15.3.3</a>). Python errors arrive in the poll result and in the
+completion event. Every response carries <code>X-Pythond-Protocol: 2</code>.
+Once a request has resolved its session, the response carries
+<code>X-Pythond-Session-Id</code>, the id of the worker that handled it (for
+<code>kill</code>, the worker that was removed); a 404 for a missing session
+has none. A <code>run</code> that executed also carries
+<code>X-Pythond-Cell-Id</code>.</p>
 
-<h2>Completion events: no polling loop</h2>
+<h2>Busy</h2>
+<p>One cell runs at a time per session. <code>fire</code> queues behind the
+running cell. <code>run</code>, <code>vars</code>, <code>complete</code>,
+<code>/pickle</code> and the fork snapshot return <code>409 busy</code> right
+away while a cell is running; the refused code is discarded and the session
+stays healthy. <code>status</code>, <code>poll</code> and <code>int</code> work
+during a running cell (<code>status</code> reports <code>vars: null</code>
+meanwhile). One command is in flight per worker at a time; a second command
+arriving meanwhile also gets <code>409 busy</code>. <code>run</code> waits 30
+seconds for the reply; a cell that runs longer keeps running, but the reply
+timeout (like a malformed or oversized reply) leaves the channel out of sync,
+and the way on is <code>kill</code> then <code>new</code>. Long work goes
+through <code>fire</code>.</p>
+
+<h2>Completion events</h2>
 <pre>curl -N --unix-socket $XDG_RUNTIME_DIR/pythond/pythond.sock http://pythond/events</pre>
-<p>Subscribe before submitting work. Workers push completion frames to the
-daemon; a condition notification wakes subscribers. The daemon does not scan
-cells or call <code>poll</code>. TCP uses the same bearer-token header as other
-routes. Fifteen-second SSE comments are connection heartbeats, not task polling.</p>
+<p>The worker pushes a frame over its pipe when a cell completes; the daemon
+appends it to a replay log and wakes every subscriber. TCP uses the same bearer
+token header as the other routes. A comment line every 15 seconds keeps the
+connection alive. Each event has a JSON body and, except <code>reset</code>,
+an <code>id</code> (<code>&lt;daemon-epoch&gt;:&lt;sequence&gt;</code>); the
+retained ones (<code>session_created</code>, <code>cell_done</code>,
+<code>session_closed</code>) also carry a <code>timestamp</code> (Unix seconds
+at publication).</p>
 <ul>
-<li><code>ready</code> establishes the initial event ID, also available in
-<code>X-Pythond-Event-Cursor</code>. No cursor means future events only.</li>
-<li><code>cell_done</code> carries JSON: session name, <code>session_id</code>
-(worker incarnation), <code>cell_id</code>, <code>status: "done"</code>, boolean
-<code>error</code>, <code>output</code>, <code>output_bytes</code>, and
-<code>output_truncated</code>. Fork adds merged/skipped counts.</li>
-<li><code>session_closed</code> identifies the lost worker and reason:
-<code>killed</code>, <code>replaced</code>, or <code>exited</code>.</li>
+<li><code>ready</code>: the starting cursor, also in
+<code>X-Pythond-Event-Cursor</code>. Subscribing without a cursor starts from now.</li>
+<li><code>session_created</code>: session, session_id, pid. Sent once the worker
+owns the name.</li>
+<li><code>cell_done</code>: session, <code>session_id</code>, <code>cell_id</code>,
+<code>status: "done"</code>, <code>error</code>, <code>output</code> (last 64 KiB),
+<code>output_bytes</code>, <code>output_truncated</code>, <code>sync</code>,
+<code>code_head</code> (first 512 bytes of the source). <code>sync</code> is true
+for <code>run</code> (correlate with <code>X-Pythond-Cell-Id</code>; the full
+output is in the HTTP reply) and false for <code>fire</code> / <code>fork</code>
+(full output at the receipt's <code>Location</code>). Fork adds merged/skipped
+counts.</li>
+<li><code>session_closed</code>: session, session_id, reason
+(<code>killed</code>, <code>replaced</code>, <code>exited</code>).</li>
 </ul>
-<p>Reconnect with <code>Last-Event-ID</code> (or <code>?since=</code>; the header
-wins). Retained events after that ID are replayed, not consumed. IDs combine a
-daemon epoch and sequence; deduplicate them. Invalid cursors return JSON 400,
-a changed epoch or future cursor returns 409, an evicted cursor returns 410.
-An open stream that falls behind receives <code>event: reset</code> and closes.</p>
-<p>Replay is bounded to 256 events / 8 MiB by default, not durable or exactly-once.
-Configure <code>PYTHOND_MAX_EVENTS</code> / <code>PYTHOND_MAX_EVENT_BYTES</code>.
-Output snapshots contain at most the last 64 KiB of UTF-8 text; when truncated,
-fetch the full result from the receipt's <code>Location</code>. Poll results
-become eligible for eviction 300 seconds after completion, not launch. Replay
-retention is independent of that TTL.</p>
-<p>Disconnecting or reloading a client never cancels Python work. Daemon shutdown
-closes streams; a restart loses sessions and changes the epoch and TCP token.
-Adapters must persist their own cursor and job ownership, match the receipt's
-<code>X-Pythond-Session-Id</code> plus cell ID, buffer completions that precede
-the receipt, and deliver only to the owning conversation. Reconcile gaps with
-<code>poll</code> where possible; never blindly resubmit code after a lost reply.</p>
+<p>Reconnect with <code>Last-Event-ID</code> (or <code>?since=</code>) to replay
+the events after that cursor; order by cursor, deduplicate by id. A cursor from
+another daemon epoch or from the future gets 409, an evicted one 410; a live
+stream that falls behind gets <code>event: reset</code> with the current cursor
+and closes. The log keeps 256 events / 8 MiB
+(<code>PYTHOND_MAX_EVENTS</code> / <code>PYTHOND_MAX_EVENT_BYTES</code>) for the
+daemon's lifetime; poll results stay for 300 seconds after completion. Closing a
+subscription leaves Python running. A daemon restart starts a new epoch, a new
+TCP token and an empty session table. Subscribers see every session;
+<code>code_head</code> and <code>output</code> share the auth boundary of
+execution.</p>
 
 <h2>Objects move as pickles</h2>
 
@@ -230,21 +251,21 @@ pysh cp work: backup:           # clone the picklable namespace
 </pre>
 
 <p>Unpicklable values (sockets, locks, modules) are skipped and reported.
-POSTing a pickle is arbitrary code loading by design &mdash; the same trust
-boundary as <code>/run</code>.</p>
+Unpickling runs code, so POSTing a pickle has the same trust boundary as
+<code>/run</code>.</p>
 
 <h2>Attach</h2>
 
 <p><code>pysh attach work</code> is a client-side line REPL: readline history
 and tab completion live in the client, every complete block runs as one cell
 in the shared namespace. Ctrl-D detaches; the session stays alive
-(<code>pysh kill</code> ends it). It is line-oriented, not a PTY.</p>
+(<code>pysh kill</code> ends it). It is line-oriented.</p>
 
 <h2>Commands</h2>
 
 <pre>
-pysh new &lt;name&gt;              create; refuse an existing name
-pysh new &lt;name&gt; --replace    explicitly discard existing state and replace
+pysh new &lt;name&gt;              create session (409 if the name exists)
+pysh new &lt;name&gt; --replace    replace an existing session
 pysh run &lt;name&gt; "code"       sync exec, raw output
 pysh run &lt;name&gt; @task.py     post a file's contents as the cell
 pysh fire &lt;name&gt; "code"      async thread, shares namespace (can't kill C code)
@@ -266,43 +287,40 @@ pyctl status                 daemon liveness
 
 <h2>Auto-checkpoint</h2>
 <p>Successful synchronous cells and successful async completions are appended
-to <code>~/.pythond/sessions/&lt;name&gt;/history.py</code>. Async checkpointing
-requires neither a subscriber nor a <code>poll</code> request. Errors are not
-checkpointed. History contains source, not a saved copy of live connections.</p>
+to <code>~/.pythond/sessions/&lt;name&gt;/history.py</code>. It holds source, so
+replaying it recreates the state.</p>
 
 <h2>Security</h2>
 
-<p>Treat pythond like SSH into a Python runtime. Not a sandbox: code runs
-with the daemon user's OS permissions. Once connected, a client has full
-access to all sessions &mdash; the same as a login shell.</p>
+<p>Treat pythond like SSH into a Python runtime. Code runs with the daemon
+user's OS permissions, and a connected client has full access to all
+sessions, the same as a login shell.</p>
 
 <table>
 <tr><th>Mode</th><th>Auth</th></tr>
 <tr><td>Local POSIX</td><td>AF_UNIX socket, mode 0o600 &mdash; filesystem permissions</td></tr>
 <tr><td>Local Windows</td><td>127.0.0.1 + bearer token in <code>%LOCALAPPDATA%\pythond</code></td></tr>
-<tr><td>Remote</td><td>ssh's problem, on purpose</td></tr>
+<tr><td>Remote</td><td>ssh</td></tr>
 </table>
 
-<p>The daemon never binds a non-loopback address. There is no network
-listener to harden.</p>
+<p>The daemon binds only the unix socket or 127.0.0.1; ssh or a reverse proxy
+carries remote access.</p>
 
 <p>Session names are lowercase only: <code>a-z</code>, <code>0-9</code>,
 underscore, and hyphen, up to 80 characters. Windows reserved device names
 such as <code>CON</code>, <code>NUL</code>, <code>COM1</code>, and
 <code>LPT1</code> are rejected.</p>
 
-<p>Like shell history under SSH, pythond session history and live namespaces
-can expose secrets. <code>history.py</code> may contain executed Python
-source. Do not paste API keys, passwords, tokens, or other secrets into cells
-unless you are willing for them to persist in that session and its local
-files.</p>
+<p>Like shell history under SSH, <code>history.py</code> holds executed source
+and the live process holds assigned values until they are overwritten or the
+session is killed. A secret pasted into a cell persists in both.</p>
 
 <h2>Platform</h2>
 
 <table>
 <tr><th>Platform</th><th>Transport</th><th>Notes</th></tr>
 <tr><td>Linux / macOS / WSL</td><td>HTTP over AF_UNIX</td><td>full featured</td></tr>
-<tr><td>Windows</td><td>HTTP over 127.0.0.1 + token</td><td>full featured except fork (no COW fork)</td></tr>
+<tr><td>Windows</td><td>HTTP over 127.0.0.1 + token</td><td>everything except fork</td></tr>
 </table>
 
 <h2>Dependencies</h2>

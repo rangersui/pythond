@@ -1,8 +1,8 @@
 # CloakBrowser -- Stealth Web Browsing
 
 Source-level stealth Chromium. Dozens of C++ patches covering canvas, WebGL,
-audio, fonts, GPU, screen, WebRTC, network timing, and automation signals. No
-runtime JS injection -- anti-bot systems cannot detect the patching.
+audio, fonts, GPU, screen, WebRTC, network timing, and automation signals.
+The patches are compiled in, so pages see a stock browser.
 
 Read this reference when the task involves web scraping, browsing behind
 anti-bot protection, or interacting with sites that detect automation.
@@ -22,8 +22,8 @@ page.goto("https://example.com")
 print(page.title())
 ```
 
-`browser` and `page` persist in the pythond namespace. Do not call
-`browser.close()` -- keep it alive across turns like any other connection.
+`browser` and `page` persist in the pythond namespace; keep the browser open
+across turns like any other connection.
 
 With proxy and geo-IP:
 ```python
@@ -109,7 +109,7 @@ browser = launch(
 
 ## Verify stealth
 
-Run these checks after setup. All three should show no automation detected:
+Run these checks after setup. All three should pass:
 
 ```python
 page.goto("https://abrahamjuliot.github.io/creepjs/")  # trust score > 70% = good
@@ -121,8 +121,7 @@ page.goto("https://pixelscan.net/")                     # "consistent" verdict =
 
 Use cloakserve when the browser must outlive Python -- e.g. multiple pythond
 sessions sharing one browser, or you need to restart Python without losing
-browser state. For most tasks launch() in a pythond session is simpler and
-sufficient.
+browser state. `launch()` in a pythond session covers most tasks.
 
 ### Docker
 
@@ -197,5 +196,4 @@ Query params: `fingerprint`, `timezone`, `locale`, `platform`,
 
 ## Security
 
-CDP has zero authentication. Always bind to `127.0.0.1`. Never expose
-port 9222 to the network.
+CDP carries no authentication of its own, so bind it to `127.0.0.1` only.
