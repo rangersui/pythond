@@ -114,7 +114,7 @@ import urllib.parse
 import ast as _ast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 JsonDict = dict[str, typing.Any]
 
