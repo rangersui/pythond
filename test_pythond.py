@@ -1329,24 +1329,58 @@ def test_integration_auth():
 def test_integration_second_daemon_fails():
     section("INTEGRATION: second daemon fails loud")
     with tempfile.TemporaryDirectory() as td, _Daemon(td) as d:
+        # Windows: the TCP bind fails (no SO_REUSEADDR).  POSIX: the socket
+        # liveness probe refuses to take over a live daemon.  Both exit 1.
         second = subprocess.run(
             [sys.executable, str(ROOT / "pythond.py"), "daemon"],
             env=d.env, capture_output=True, text=True, timeout=15,
         )
-        if _HAS_AF_UNIX:
-            # AF_UNIX: the new daemon unlinks and rebinds the socket path; the
-            # old daemon keeps serving existing connections.  Windows TCP: the
-            # second bind must fail.  Either way exactly one daemon owns the
-            # endpoint afterwards.
-            check("unix rebind is a takeover (documented)", True)
-            with contextlib.suppress(Exception):
-                pythond._request("POST", "/stop")
-        else:
-            check("second daemon exits nonzero", second.returncode == 1,
-                  second.stderr)
-            check("second daemon says why",
-                  "cannot start daemon" in second.stderr, second.stderr)
-            pythond._request("POST", "/stop")
+        check("second daemon exits nonzero", second.returncode == 1,
+              second.stderr)
+        check("second daemon says why",
+              "cannot start daemon" in second.stderr, second.stderr)
+        status, _h, _t = pythond._request("GET", "/ls")
+        check("first daemon still serving", status == 200)
+        pythond._request("POST", "/stop")
+    if _HAS_AF_UNIX:
+        # A stale socket (no daemon accepting) must NOT block startup.
+        with tempfile.TemporaryDirectory() as td:
+            stale = os.path.join(td, "pythond.sock")
+            holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            holder.bind(stale)
+            holder.close()  # socket file left behind, nothing accepting
+            env = os.environ.copy()
+            env["PYTHOND_SOCK"] = stale
+            proc = subprocess.Popen(
+                [sys.executable, str(ROOT / "pythond.py"), "daemon"],
+                env=env, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                up = wait_until(lambda: proc.poll() is None and
+                                os.path.exists(stale) and
+                                _unix_socket_alive(stale))
+                check("stale socket is replaced", up,
+                      proc.stderr.read() if proc.poll() is not None else "")
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+
+
+def _unix_socket_alive(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def test_integration_pickle_cp():

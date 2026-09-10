@@ -1285,6 +1285,23 @@ def daemon(show_token: bool = False) -> None:
     try:
         if _HAS_AF_UNIX:
             sock = _sock_path()
+            if os.path.exists(sock):
+                # Refuse to take over a live daemon's socket; only a stale
+                # socket (nothing accepting) may be replaced.  Symmetric with
+                # the Windows no-SO_REUSEADDR policy: fail loud.
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # type: ignore[attr-defined]
+                probe.settimeout(1.0)
+                try:
+                    probe.connect(sock)
+                except (ConnectionRefusedError, FileNotFoundError):
+                    pass  # stale socket -- safe to replace
+                except OSError:
+                    raise OSError(f"daemon already running at {sock} "
+                                  "(socket did not refuse)")
+                else:
+                    raise OSError(f"daemon already running at {sock}")
+                finally:
+                    probe.close()
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(sock)
             old_umask = os.umask(0o177)
