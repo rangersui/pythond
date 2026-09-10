@@ -57,7 +57,7 @@ def section(title):
 def test_version():
     section("version")
     check("version is string", isinstance(pythond.__version__, str))
-    check("version is 0.5.0", pythond.__version__ == "0.5.0")
+    check("version is 0.5.1", pythond.__version__ == "0.5.1")
 
 
 def test_zero_dependencies():
