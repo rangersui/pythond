@@ -2,6 +2,7 @@
 All daemon operations use private endpoints and temporary homes.
 """
 import contextlib
+import errno
 import io
 import os
 from pathlib import Path
@@ -123,6 +124,74 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(client.state.connection_error)
         self.assertEqual(client.state.connection_label(), '0 sessions')
 
+    def test_exit_is_terminal_and_late_start_never_spawns(self):
+        client = tray.TrayClient(quit_ui=mock.Mock())
+        self.addCleanup(client.stop)
+        refused = ConnectionRefusedError(errno.ECONNREFUSED, 'private endpoint stopped')
+        with mock.patch.object(pythond, '_request', side_effect=[(200, {}, ''), refused]):
+            client.exit_daemon()
+        self.assertTrue(client.stopping.is_set())
+        client.quit_ui.assert_called_once()
+        with mock.patch.object(pythond, '_request') as request, \
+             mock.patch.object(tray.subprocess, 'Popen') as spawn:
+            client.action('start')
+            client.start_daemon()
+            request.assert_not_called()
+            spawn.assert_not_called()
+        self.assertFalse(client.action_lock.locked())
+
+    def test_exit_disables_actions_and_failure_clears_exiting(self):
+        client = tray.TrayClient()
+        self.addCleanup(client.stop)
+        release = threading.Event()
+        def fail_exit():
+            release.wait(2)
+            raise RuntimeError('stop failed')
+        with mock.patch.object(client, 'exit_daemon', side_effect=fail_exit), \
+             mock.patch.object(client, 'start_daemon') as start, \
+             contextlib.redirect_stderr(io.StringIO()):
+            client.action('exit')
+            self.assertTrue(client.exiting.is_set())
+            client.action('start')
+            start.assert_not_called()
+            release.set()
+            self.assertTrue(wait_until(lambda: not client.action_lock.locked()))
+        self.assertFalse(client.exiting.is_set())
+        self.assertFalse(client.stopping.is_set())
+
+    def test_cancel_start_is_not_readiness_failure(self):
+        client = tray.TrayClient()
+        self.addCleanup(client.stop)
+        calls = []
+        def refuse(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                client.stopping.set()
+            raise ConnectionRefusedError(errno.ECONNREFUSED, 'private endpoint absent')
+        with mock.patch.object(pythond, '_request', side_effect=refuse), \
+             mock.patch.object(tray.subprocess, 'Popen') as spawn:
+            spawn.return_value.poll.return_value = None
+            client.start_daemon()
+            spawn.assert_called_once()
+        self.assertTrue(client.stopping.is_set())
+
+    def test_autostart_only_when_offline_and_local(self):
+        refused = ConnectionRefusedError(errno.ECONNREFUSED, 'nothing listening')
+        with mock.patch.object(pythond, '_request', side_effect=refused),              mock.patch.object(tray.TrayClient, 'action') as action:
+            client = tray.TrayClient()
+            self.addCleanup(client.stop)
+            client.autostart()
+            action.assert_called_once_with('start')
+            action.reset_mock()
+            with mock.patch.dict(os.environ, {'PYTHOND_HOST': '127.0.0.1:7984'}):
+                client.autostart()
+            action.assert_not_called()
+        with mock.patch.object(pythond, '_request', return_value=(200, {}, '(no sessions)')),              mock.patch.object(tray.TrayClient, 'action') as action:
+            client = tray.TrayClient()
+            self.addCleanup(client.stop)
+            client.autostart()
+            action.assert_not_called()
+
     def test_start_online_never_spawns(self):
         client = tray.TrayClient()
         self.addCleanup(client.stop)
@@ -163,13 +232,13 @@ assert all(name not in sys.modules for name in ('pystray', 'PIL', 'psutil'))
 sys.platform = 'linux'
 os.environ.pop('DISPLAY', None)
 os.environ.pop('WAYLAND_DISPLAY', None)
-pythond_tray.tray_main()
+pythond_tray.tray_main([])
 '''
         result = subprocess.run([sys.executable, '-S', '-c', script, str(ROOT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn('requires a desktop display', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
-        missing = script[:script.index("sys.platform = 'linux'")] + "sys.platform = 'win32'\nif os.name == 'nt':\n import ctypes\n ctypes.windll.user32.GetShellWindow = lambda: 1\npythond_tray.tray_main()\n"
+        missing = script[:script.index("sys.platform = 'linux'")] + "sys.platform = 'win32'\nif os.name == 'nt':\n import ctypes\n ctypes.windll.user32.GetShellWindow = lambda: 1\npythond_tray.tray_main([])\n"
         result = subprocess.run([sys.executable, '-S', '-c', missing, str(ROOT)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn('pip install "pythond[tray]"', result.stderr)
@@ -357,6 +426,11 @@ class DesktopTests(unittest.TestCase):
                         self.assertTrue(wait_until(lambda: any('0 sessions' in s for s in labels())))
                         self.assertTrue(wait_until(lambda: dot() == (136, 136, 136)))
                         click('Exit')
+                        self.assertEqual(labels(), ['Exiting...'])
+                        # Open a real native popup while shutdown is in flight.
+                        # A WM_QUIT posted inside its modal loop can be consumed.
+                        from pystray._util import win32
+                        win32.PostMessage(icon._hwnd, win32.WM_NOTIFY, 0, win32.WM_RBUTTONUP)
                     except BaseException as exc:
                         failures.append(exc)
                         icon.stop()
@@ -373,7 +447,7 @@ class DesktopTests(unittest.TestCase):
                     watchdog.cancel()
             with mock.patch.object(pystray.Icon, 'run', run), \
                  mock.patch.object(tray.TrayClient, 'start_daemon', slow_start):
-                tray.tray_main()
+                tray.tray_main(['--no-start'])
             # Cleanup only this test's private daemon if a preceding assertion failed.
             try:
                 pythond._request('POST', '/stop')

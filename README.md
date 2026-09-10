@@ -372,7 +372,8 @@ pip install "pythond[tray]"    # adds pystray, Pillow and psutil
 pythond-tray                   # or: python -m pythond_tray
 ```
 
-The tray is an observer on `/events`. Its icon is green while sessions
+At launch the tray starts the daemon if nothing is listening locally
+(`pythond-tray --no-start` only observes). Its icon is green while sessions
 exist, gray for an empty daemon, red while disconnected, and a yellow spinner
 while a daemon is starting. Right-click gives Start daemon (while offline),
 Kill per session, Kill all sessions, Exit (stops the daemon and the tray) and

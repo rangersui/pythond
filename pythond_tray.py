@@ -1,6 +1,7 @@
 """Optional desktop observer for pythond. No GUI imports until tray_main()."""
 from __future__ import annotations
 
+import argparse
 import codecs
 from collections import deque
 from dataclasses import dataclass
@@ -232,6 +233,7 @@ class TrayClient:
         self.reconnect_delay = reconnect_delay
         self.stopping = threading.Event()
         self.starting = threading.Event()
+        self.exiting = threading.Event()
         self.connected_ready = threading.Event()
         self.skip_delay = False
         self.action_lock = threading.Lock()
@@ -386,11 +388,17 @@ class TrayClient:
             raise ValueError("Choose an explicit tray action; single kill requires a session")
         if not self.action_lock.acquire(blocking=False):
             return
-        if name == "start":
-            self.starting.set()
+        if self.stopping.is_set():
+            self.action_lock.release()
+            return
+        activity = self.starting if name == "start" else self.exiting if name == "exit" else None
+        if activity is not None:
+            activity.set()
             self.changed()
         def work() -> None:
             try:
+                if self.stopping.is_set():
+                    return
                 if name == "start":
                     self.start_daemon()
                     if not self.stopping.is_set() and not self.connected_ready.is_set():
@@ -410,14 +418,26 @@ class TrayClient:
                 self.state.note(str(exc))
                 print(f"pythond-tray: {exc}", file=sys.stderr)
             finally:
-                if name == "start":
-                    self.starting.clear()
+                if activity is not None:
+                    activity.clear()
                 self.action_lock.release()
                 if not self.stopping.is_set():
                     self.changed()
         threading.Thread(target=work, name="pythond-tray-command", daemon=True).start()
 
+    def autostart(self) -> None:
+        """Start the daemon at launch when nothing is listening locally."""
+        if os.environ.get("PYTHOND_HOST"):
+            return
+        try:
+            pythond._request("GET", "/ls")
+        except OSError as exc:
+            if offline(exc):
+                self.action("start")
+
     def start_daemon(self) -> None:
+        if self.stopping.is_set():
+            return
         try:
             status, _, _ = pythond._request("GET", "/ls")
             if status == 200:
@@ -426,6 +446,8 @@ class TrayClient:
         except OSError as exc:
             if not offline(exc):
                 raise
+        if self.stopping.is_set():
+            return
         if os.environ.get("PYTHOND_HOST"):
             raise RuntimeError("Start daemon is local; start the tunneled daemon on its host")
         kwargs: dict[str, Any] = {}
@@ -454,7 +476,8 @@ class TrayClient:
             if child.poll() is not None:
                 raise RuntimeError(f"daemon start exited; log: {log_path}")
             self.stopping.wait(.2)
-        raise RuntimeError(f"daemon readiness not confirmed; log: {log_path}")
+        if not self.stopping.is_set():
+            raise RuntimeError(f"daemon readiness not confirmed; log: {log_path}")
 
     def exit_daemon(self) -> None:
         status, _, _ = pythond._request("POST", "/stop")
@@ -483,7 +506,11 @@ class TrayClient:
             raise RuntimeError("daemon has not stopped yet")
 
 
-def tray_main() -> None:
+def tray_main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="pythond-tray", description="pythond desktop tray")
+    parser.add_argument("--no-start", dest="auto_start", action="store_false",
+                        help="observe only; leave an offline daemon alone at launch")
+    args = parser.parse_args(argv)
     if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         print("pythond-tray requires a desktop display; use pysh/pyctl on this server.", file=sys.stderr)
         raise SystemExit(1)
@@ -539,14 +566,17 @@ def tray_main() -> None:
 
     def menu_items():
         connected, sessions, recent = state.view()
+        if client.exiting.is_set() or client.stopping.is_set():
+            yield item("Exiting...", None, enabled=False)
+            return
         if client.starting.is_set():
             yield item("Starting...", None, enabled=False)
-            yield item("Quit tray", lambda icon, entry: icon.stop())
+            yield item("Quit tray", lambda icon, entry: client.quit_ui())
             return
         if not connected or state.need_snapshot:
             yield item(state.connection_label(), None, enabled=False)
             yield item("Start daemon", lambda icon, entry: client.action("start"))
-            yield item("Quit tray", lambda icon, entry: icon.stop())
+            yield item("Quit tray", lambda icon, entry: client.quit_ui())
             return
         yield item(f"pythond {pythond.__version__} - {len(sessions)} sessions", None, enabled=False)
         yield pystray.Menu.SEPARATOR
@@ -601,9 +631,11 @@ def tray_main() -> None:
             # Windows caches native menus. Refresh on the desktop thread and
             # never destroy a menu while TrackPopupMenuEx is using its handle.
             menu_open = False
+            quit_requested = False
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._message_handlers[0x8001] = lambda w, l: changed()
+                self._message_handlers[0x8002] = self._quit_on_desktop
                 self._message_handlers[0x02E0] = self._dpi_changed  # WM_DPICHANGED
                 self._message_handlers[0x007E] = self._dpi_changed  # WM_DISPLAYCHANGE
             def _dpi_changed(self, wparam, lparam):
@@ -625,7 +657,19 @@ def tray_main() -> None:
                     os.unlink(path)
             def request_refresh(self):
                 post_message(self._hwnd, 0x8001, 0, 0)
+            def request_quit(self):
+                self.quit_requested = True
+                post_message(self._hwnd, 0x8002, 0, 0)
+            def _quit_on_desktop(self, wparam, lparam):
+                # EndMenu must run on the desktop thread. Post WM_STOP only
+                # after TrackPopupMenuEx unwinds, not inside its modal loop.
+                if self.menu_open:
+                    user32.EndMenu()
+                else:
+                    self.stop()
             def _on_notify(self, wparam, lparam):
+                if self.quit_requested:
+                    return
                 if lparam != 0x0205:  # WM_RBUTTONUP
                     return super()._on_notify(wparam, lparam)
                 # Native menu fonts/spacing use their owner's monitor DPI.
@@ -639,7 +683,10 @@ def tray_main() -> None:
                     return super()._on_notify(wparam, lparam)
                 finally:
                     self.menu_open = False
-                    self.update_menu()
+                    if self.quit_requested:
+                        self.stop()
+                    else:
+                        self.update_menu()
         icon_class = RefreshIcon
     icon = icon_class("pythond", render(icon_size(), "red"), "pythond", pystray.Menu(menu_items))
     current_color = "red"
@@ -651,13 +698,32 @@ def tray_main() -> None:
         if force or color == "starting" or color != current_color or icon.icon.size != (size, size):
             icon.icon = render(size, color)
         current_color = color
-        title = "pythond - Starting..." if color == "starting" else "pythond - " + state.connection_label()
+        title = ("pythond - Exiting..." if client.exiting.is_set() or client.stopping.is_set()
+                 else "pythond - Starting..." if color == "starting"
+                 else "pythond - " + state.connection_label())
         if icon.title != title:
             icon.title = title
         if not getattr(icon, "menu_open", False):
             icon.update_menu()
     client.changed = icon.request_refresh if sys.platform == "win32" else changed
-    client.quit_ui = icon.stop
+    run_done = threading.Event()
+    def quit_ui():
+        client.stopping.set()
+        if sys.platform == "win32":
+            icon.request_quit()
+        else:
+            icon.stop()
+        # A WM_QUIT can still be lost to a modal loop; re-post until run() returns.
+        def retry():
+            for _ in range(5):
+                if run_done.wait(3):
+                    return
+                if sys.platform == "win32" and getattr(icon, "menu_open", False):
+                    icon.request_quit()
+                else:
+                    icon._stop()
+        threading.Thread(target=retry, name="pythond-tray-quit-retry", daemon=True).start()
+    client.quit_ui = quit_ui
     def animate():
         while not client.stopping.is_set():
             client.starting.wait()
@@ -669,12 +735,15 @@ def tray_main() -> None:
         running_icon.visible = True
         animation.start()
         client.start()
+        if args.auto_start:
+            client.autostart()
     try:
         icon.run(setup=setup)
     except Exception as exc:
         print(f"pythond-tray desktop error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     finally:
+        run_done.set()
         client.stop()
         client.starting.set()  # Wake the idle animation thread so it can exit.
         if animation.ident is not None:
