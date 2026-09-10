@@ -157,6 +157,7 @@ POST /int/&lt;name&gt;              JSON interrupt report
 GET  /pickle/&lt;name&gt;[/&lt;var&gt;]   pickled var (or whole picklable namespace)
 POST /pickle/&lt;name&gt;[/&lt;var&gt;]   unpickle body into var (or merge a dict)
 POST /kill/&lt;name&gt;             kill session
+POST /kill                    kill current sessions; JSON killed names + count
 POST /stop                    stop daemon
 </pre>
 
@@ -184,6 +185,8 @@ Once a request has resolved its session, the response carries
 has none. A <code>run</code> that executed also carries
 <code>X-Pythond-Cell-Id</code>.</p>
 
+<h2>Kill all</h2>
+<p><code>pysh kill --all</code> sends <code>POST /kill</code>, returning 200 JSON <code>{"killed": ["work", "train"], "count": 2}</code>; an empty daemon returns <code>{"killed": [], "count": 0}</code>. The operation snapshots worker instances, leaving later creations and same-name replacements alone. Each removed worker emits session_closed with reason killed. The daemon, token, epoch, SSE connections and checkpoint files remain. CLI requires exactly one name or --all.</p>
 <h2>Busy</h2>
 <p>One cell runs at a time per session. <code>fire</code> queues behind the
 running cell. <code>run</code>, <code>vars</code>, <code>complete</code>,
@@ -273,6 +276,7 @@ pysh fork &lt;name&gt; "code"      async process (POSIX), killable, pickles vars
 pysh poll &lt;name&gt; [cell_id]   check async result
 pysh int &lt;name&gt;              interrupt (fire=best effort, fork=kill)
 pysh kill &lt;name&gt;             terminate session
+pysh kill --all              terminate current sessions, keep daemon running
 pysh ls                      list sessions
 pysh status &lt;name&gt;           JSON health
 pysh vars &lt;name&gt;             JSON namespace names

@@ -83,6 +83,7 @@ pysh poll <name> [cell_id]   # read async result
 pysh attach <name>           # human line REPL, Ctrl-D detaches
 pysh int <name>              # fire=best effort, fork=kill
 pysh kill <name>             # terminate session
+pysh kill --all              # terminate current sessions, keep daemon running
 pysh ls                      # list sessions
 pysh status <name>           # JSON health
 pysh vars <name>             # JSON namespace names
@@ -322,6 +323,12 @@ fork can overwrite a variable that the parent changed while the fork was
 running.
 
 ## Session Lifecycle
+
+`pysh kill --all` (`POST /kill`) removes the current worker snapshot and returns
+`{"killed": [...], "count": N}` (200, also when empty). Later creations and
+same-name replacements are left alone. Each removed worker emits
+`session_closed` with reason `killed`; daemon, token, epoch, SSE connections
+and checkpoint history remain. `pysh kill` requires a name or explicit `--all`.
 
 Sessions survive indefinitely while the daemon runs. If the daemon restarts,
 sessions are lost -- replay from checkpoint history (see below). If a session

@@ -1484,6 +1484,92 @@ class _Events:
         self.close()
 
 
+def test_kill_all_snapshot():
+    section("kill-all snapshots worker identity, not just names")
+    first, old, newer, later, gone = [_fake_session() for _ in range(5)]
+    closed = []
+    def close(worker):
+        closed.append(worker)
+        if worker is first:
+            # Concurrent replacement, creation and removal after the snapshot.
+            with pythond._sessions_lock:
+                pythond.sessions["second"] = newer
+                pythond.sessions["later"] = later
+                pythond.sessions.pop("gone")
+    with mock.patch.dict(pythond.sessions, {"first": first, "second": old, "gone": gone}, clear=True), \
+         mock.patch.object(pythond, "_close_session", side_effect=close), \
+         mock.patch.object(pythond, "_session_closed") as event:
+        check("only original surviving snapshot members are killed",
+              pythond.kill_all_sessions() == ["first"])
+        check("new same-name incarnation and later creation survive",
+              pythond.sessions == {"second": newer, "later": later})
+        check("close/event operate exactly once on selected worker",
+              len(closed) == 1 and closed[0] is first and event.call_count == 1 and
+              event.call_args.args == ("first", first, "killed"))
+
+
+def test_kill_all_cli():
+    section("kill CLI requires explicit name or --all")
+    for entry in (pythond.pysh_main, pythond.main):
+        for argv, path in ((["kill", "work"], "/kill/work"), (["kill", "--all"], "/kill")):
+            with mock.patch.object(sys, "argv", ["pysh"] + argv), \
+                 mock.patch.object(pythond, "_request", return_value=(200, {}, '{"killed": [], "count": 0}')) as req, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                entry()
+            check("kill CLI selects exact endpoint", req.call_args.args == ("POST", path))
+        for argv in (["kill"], ["kill", "work", "--all"], ["kill", "--all", "work"]):
+            with mock.patch.object(sys, "argv", ["pysh"] + argv), \
+                 mock.patch.object(pythond, "_request") as req, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    entry()
+                    check("ambiguous kill CLI rejected", False)
+                except SystemExit as e:
+                    check("ambiguous kill CLI rejected before HTTP", e.code == 2 and not req.called)
+
+
+def test_integration_kill_all():
+    section("INTEGRATION: kill-all preserves daemon, token, epoch, stream and history")
+    with tempfile.TemporaryDirectory() as td, _Daemon(td):
+        ids, history = {}, {}
+        for name in ("work", "browser", "train"):
+            _, headers, _ = pythond._request("POST", "/new/" + name)
+            ids[name] = headers["X-Pythond-Session-Id"]
+            pythond._request("POST", "/run/" + name, "value = 42")
+            path = Path(td) / ".pythond/sessions" / name / "history.py"
+            history[path] = path.read_bytes()
+        metadata = pythond._read_meta()
+        with _Events() as events:
+            epoch = events.cursor.split(":")[0]
+            status, headers, body = pythond._request("POST", "/kill")
+            check("kill-all returns JSON collection", status == 200 and
+                  headers.get("Content-Type") == "application/json" and
+                  json.loads(body) == {"killed": list(ids), "count": 3})
+            check("collection response has no single-worker identity",
+                  "X-Pythond-Session-Id" not in headers)
+            closed = [events.read(include_activity=True) for _ in ids]
+            check("one killed event for each removed incarnation",
+                  all(e["event"] == "session_closed" and e["data"]["reason"] == "killed" for e in closed) and
+                  {e["data"]["session"]: e["data"]["session_id"] for e in closed} == ids)
+            check("kill-all leaves event epoch unchanged",
+                  all(e["id"].split(":")[0] == epoch for e in closed))
+            status, _, body = pythond._request("GET", "/ls")
+            check("daemon stays alive and empty", status == 200 and body == "(no sessions)")
+            check("metadata/token unchanged", pythond._read_meta() == metadata)
+            check("kill-all leaves checkpoint files unchanged",
+                  all(p.read_bytes() == data for p, data in history.items()))
+            status, _, body = pythond._request("POST", "/kill")
+            check("empty kill-all succeeds idempotently", status == 200 and
+                  json.loads(body) == {"killed": [], "count": 0})
+            status, _, _ = pythond._request("POST", "/kill/work")
+            check("missing single-session kill remains 404", status == 404)
+            pythond._request("POST", "/new/fresh")
+            created = events.read(include_activity=True)
+            check("original SSE connection continues with new activity",
+                  created["event"] == "session_created" and created["data"]["session"] == "fresh" and
+                  created["id"].split(":")[0] == epoch)
+
+
 def test_busy_admission_and_identity():
     section("busy admission, no side effects, identity on errors and removal")
     ns = pythond._init_namespace()
@@ -2159,6 +2245,9 @@ def main():
         test_pysh_cli_smoke,
 
         # Integration tests
+        test_kill_all_snapshot,
+        test_kill_all_cli,
+        test_integration_kill_all,
         test_busy_admission_and_identity,
         test_fire_queue_preserved,
         test_integration_activity_and_long_busy,

@@ -59,6 +59,7 @@ pysh fork <name> "code"      async process (POSIX only) -> killable, pickles var
 pysh poll <name> [cell_id]   check async result
 pysh int <name>              best-effort interrupt (fire=async exc, fork=SIGKILL)
 pysh kill <name>             terminate session
+pysh kill --all              terminate current sessions, keep daemon running
 pysh ls                      list sessions
 pysh status <name>           session health (JSON)
 pysh vars <name>             namespace names (JSON)
@@ -144,6 +145,7 @@ POST /int/<name>              JSON interrupt report
 GET  /pickle/<name>[/<var>]   pickled var (or whole picklable namespace dict)
 POST /pickle/<name>[/<var>]   unpickle body into var (or merge a pickled dict)
 POST /kill/<name>             kill session
+POST /kill                    kill current sessions; JSON killed names + count
 POST /stop                    stop daemon
 ```
 
@@ -174,6 +176,16 @@ X-Pythond-Session-Id: <worker id>
 `Location` is where the result appears
 ([RFC 9110 section 15.3.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3)).
 Python errors arrive in the poll result and in the completion event.
+
+### Kill all
+
+`pysh kill --all` sends `POST /kill`: `200` JSON
+`{"killed": ["work", "train"], "count": 2}`. An empty daemon returns
+`{"killed": [], "count": 0}`. Each removed worker emits `session_closed`
+with reason `killed`; the daemon, token, event epoch, SSE connections and
+checkpoint files remain. The operation snapshots worker instances, so later
+creations (including same-name replacements) are left alone. CLI requires
+exactly one session name or `--all`.
 
 ### Busy
 

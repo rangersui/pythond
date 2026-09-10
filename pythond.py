@@ -41,6 +41,7 @@ Commands (pysh):
     pysh poll <name> [cell_id]   check async result
     pysh int <name>              best-effort interrupt (fire = async exc, fork = SIGKILL)
     pysh kill <name>             terminate session
+    pysh kill --all              terminate current sessions, keep daemon running
     pysh ls                      list sessions
     pysh status <name>           session health (JSON)
     pysh vars <name>             namespace names (JSON)
@@ -65,6 +66,7 @@ HTTP API (what pysh speaks; curl speaks it too):
     POST /complete/<name> body   JSON completion matches
     POST /int/<name>             JSON interrupt report
     POST /kill/<name>            kill session
+    POST /kill                   kill current sessions; JSON killed names + count
     POST /stop                   stop daemon
     404 = no such session/route, 409 = conflict, 401 = bad token.
 
@@ -1187,9 +1189,19 @@ def kill_session(name: str) -> bool:
     return _kill_session(name) is not None
 
 
-def _kill_session(name: str) -> JsonDict | None:
-    """Return the exact removed worker, never re-resolve a reused name."""
+def kill_all_sessions() -> list[str]:
+    """Kill the snapshotted incarnations, leaving later creations alone."""
     with _sessions_lock:
+        snapshot = list(sessions.items())
+    return [name for name, worker in snapshot
+            if _kill_session(name, expected=worker) is not None]
+
+
+def _kill_session(name: str, *, expected: JsonDict | None = None) -> JsonDict | None:
+    """Return the removed worker; optionally require snapshot identity."""
+    with _sessions_lock:
+        if expected is not None and sessions.get(name) is not expected:
+            return None
         s = sessions.pop(name, None)
     if s is None:
         return None
@@ -1344,6 +1356,10 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
                 server.shutdown()
             threading.Thread(target=_delayed_shutdown, daemon=True).start()
         return 200, {"Connection": "close"}, "OK stopping daemon"
+    if cmd == "kill" and method == "POST" and not name:
+        killed = kill_all_sessions()
+        headers["Content-Type"] = "application/json"
+        return 200, headers, json.dumps({"killed": killed, "count": len(killed)})
     if not name:
         return 404, headers, f"ERR unknown: {cmd}"
     try:
@@ -1747,6 +1763,8 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
     try:
         if cmd == "ls":
             status, _h, text = _request("GET", "/ls")
+        elif cmd == "kill-all":
+            status, _h, text = _request("POST", "/kill")
         elif cmd in ("new", "kill", "int"):
             if not args:
                 print(f"ERR usage: {cmd} <name>", file=sys.stderr)
@@ -2001,9 +2019,13 @@ def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
     p_poll = sub.add_parser("poll", help="check async result")
     p_poll.add_argument("name")
     p_poll.add_argument("cell_id", nargs="?")
+    p_kill = sub.add_parser("kill", help="terminate a session or all sessions")
+    kill_target = p_kill.add_mutually_exclusive_group(required=True)
+    kill_target.add_argument("name", nargs="?", help="session name")
+    kill_target.add_argument("--all", dest="all_sessions", action="store_true",
+                             help="terminate current sessions, keep daemon running")
     for cname, chelp in (
         ("int", "interrupt running cells"),
-        ("kill", "terminate session"),
         ("status", "session health"),
         ("vars", "namespace names"),
     ):
@@ -2029,6 +2051,9 @@ def _run_session_command(args: argparse.Namespace, argv: list[str]) -> None:
         return
     if args.command == "new":
         client("new", [args.name] + (["--replace"] if args.replace else []))
+        return
+    if args.command == "kill":
+        client("kill-all", []) if args.all_sessions else client("kill", [args.name])
         return
     client(args.command, argv[1:])
 
