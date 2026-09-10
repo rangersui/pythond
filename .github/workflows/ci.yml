@@ -35,7 +35,7 @@ jobs:
         run: python -m pip install --upgrade pip build twine
 
       - name: Compile check
-        run: python -B -m py_compile pythond.py test_pythond.py
+        run: python -B -m py_compile pythond.py test_pythond.py pythond_tray.py test_pythond_tray.py
 
       - name: Build distributions
         run: python -m build
@@ -84,3 +84,6 @@ jobs:
 
       - name: Test suite
         run: python -B test_pythond.py
+
+      - name: Tray protocol and headless tests (no GUI extra)
+        run: python -B test_pythond_tray.py

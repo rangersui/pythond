@@ -825,7 +825,7 @@ def test_new_safe_defaults():
     # A creator that loses publication must reap its unowned worker, not leak it.
     proc = _fake_session()["proc"]
     proc.stdout = io.StringIO('{"ready": true}\n')
-    with mock.patch.object(pythond.subprocess, "Popen", return_value=proc), \
+    with mock.patch.object(pythond.subprocess, "Popen", return_value=proc) as spawn, \
          mock.patch.object(pythond, "_publish_session", side_effect=RuntimeError("race")), \
          mock.patch.object(pythond, "_close_session") as close:
         try:
@@ -834,6 +834,9 @@ def test_new_safe_defaults():
         except RuntimeError:
             check("losing worker reaped", close.call_count == 1 and
                   close.call_args.args[0]["proc"] is proc)
+        expected_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        check("worker spawn suppresses Windows console only",
+              spawn.call_args.kwargs["creationflags"] == expected_flags)
 
 
 def test_event_log():

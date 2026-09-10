@@ -1109,6 +1109,7 @@ def new_session(name: str, *, replace: bool = False) -> JsonDict:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
         env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
         start_new_session=(sys.platform != "win32"),
+        creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
     )
     out_q: queue.Queue[str | None] = queue.Queue()
     s: JsonDict = {"proc": proc, "q": out_q, "lock": threading.Lock(),

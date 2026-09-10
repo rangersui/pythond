@@ -22,17 +22,21 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+tray = ["pystray", "pillow", "psutil"]
+
 [project.scripts]
 pythond = "pythond:main"
 pysh = "pythond:pysh_main"
 pyctl = "pythond:pyctl_main"
+pythond-tray = "pythond_tray:tray_main"
 
 [project.urls]
 Homepage = "https://pythond.sh"
 Repository = "https://github.com/rangersui/pythond"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["pythond.py"]
+only-include = ["pythond.py", "pythond_tray.py", "pythond_tray.png"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -43,4 +47,7 @@ include = [
     "/pyproject.toml",
     "/pythond.py",
     "/test_pythond.py",
+    "/pythond_tray.py",
+    "/pythond_tray.png",
+    "/test_pythond_tray.py",
 ]

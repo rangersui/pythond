@@ -1,5 +1,7 @@
 # pythond
 
+<img src="pythond_tray.png" width="128" alt="pythond mascot">
+
 **Persistent Python sessions. Code in, result out.**
 
 ```
@@ -362,6 +364,27 @@ Treat pythond like SSH into a Python runtime:
   inside the session.
 - If step 3 of a workflow fails, fix step 3 -- steps 1 and 2 still exist in
   memory.
+
+## Desktop tray
+
+```bash
+pip install "pythond[tray]"    # adds pystray, Pillow and psutil
+pythond-tray                   # or: python -m pythond_tray
+```
+
+The tray is an observer on `/events`. Its icon is green while sessions
+exist, gray for an empty daemon, red while disconnected, and a yellow spinner
+while a daemon is starting. Right-click gives Start daemon (while offline),
+Kill per session, Kill all sessions, Exit (stops the daemon and the tray) and
+Quit tray (the daemon keeps running). The menu lists each session with pid,
+age and the RSS / CPU of its process tree, sampled when the menu opens (CPU is
+averaged between samples, 100% = one core, first sample `n/a`; a `+` after
+RSS means part of the tree was unreadable), plus the last five activities.
+Existing sessions come from `/ls` at connect; creation time and worker id
+fill in from `session_created` events. With `PYTHOND_HOST` set the tray
+observes the remote daemon and skips process sampling. On Windows the tray is
+per-monitor DPI aware and renders the icon at the taskbar's size.
+`import pythond` stays free of GUI imports.
 
 ## Tests
 
