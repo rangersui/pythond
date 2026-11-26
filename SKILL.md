@@ -128,9 +128,11 @@ pysh int work                # kills fork'd process
 `fire` cells in one session run serially under the session lock. Use multiple
 sessions for real parallelism.
 
-`run` waits 30 seconds for the reply. A cell that runs longer keeps running,
-but the channel is then out of sync and the way on is `kill` then `new`.
-Anything that might take longer goes through `fire` or `fork`.
+`run` waits 30 seconds for the reply; give a known-slow cell more with
+`pysh run --timeout 5m <name> ...` (seconds or `s`/`m`/`h`, before or after the
+name). An outer shell `timeout` only kills the client, never the wait. A cell
+that outlives its wait keeps running, but the channel is then out of sync and
+the way on is `kill` then `new`. Work of unknown length goes through `fire` or `fork`.
 
 ## State Persists
 
@@ -351,7 +353,7 @@ killed. A secret pasted into a cell persists in both.
 - `pysh` is a function call: source in, captured output out.
 - Source goes in the request body or an `@file`.
 - Once a session exists, task state lives in it.
-- Cells that may exceed 30s go through `fire` or `fork`.
+- Cells that may exceed 30s get `run --timeout`, or go through `fire` / `fork` when their length is unknown.
 
 ## References
 

@@ -2186,6 +2186,75 @@ def test_integration_fork():
                                "sessions", name), ignore_errors=True)
 
 
+def test_prefer_wait_parsing():
+    section("Prefer: wait parsing (RFC 7240)")
+    pw = pythond._prefer_wait
+    check("absent -> None", pw([]) is None)
+    check("plain wait", pw(["wait=120"]) == 120.0)
+    check("among other prefs", pw(["respond-async, wait=45"]) == 45.0)
+    check("repeated header, first wait wins", pw(["return=minimal", "wait=7", "wait=9"]) == 7.0)
+    check("case-insensitive name, quoted value", pw(['WAIT="12"']) == 12.0)
+    check("malformed ignored", pw(["wait=abc", "wait=-3", "wait=0", "wait="]) is None)
+    check("clamped to max", pw([f"wait={int(pythond._MAX_RUN_WAIT) * 10}"]) == pythond._MAX_RUN_WAIT)
+
+
+def test_cli_run_timeout_parsing():
+    section("pysh run --timeout")
+    seen = {}
+    def fake_client(cmd, args, fail_on_err=True, wait=None):
+        seen.clear(); seen.update(cmd=cmd, args=args, wait=wait)
+    def pysh(*argv, env=None):
+        with mock.patch.object(pythond, "client", fake_client), \
+             mock.patch.dict(os.environ, env or {}), \
+             mock.patch.object(sys, "argv", ["pysh", *argv]):
+            if not env:
+                os.environ.pop("PYTHOND_TIMEOUT", None)
+            pythond.pysh_main()
+        return dict(seen)
+    want = {"cmd": "run", "args": ["work", "x", "+", "1"], "wait": 300.0}
+    check("before the name", pysh("run", "--timeout", "300", "work", "x", "+", "1") == want)
+    check("after the name", pysh("run", "work", "--timeout", "300", "x", "+", "1") == want)
+    check("--timeout=5m", pysh("run", "work", "--timeout=5m", "x", "+", "1")["wait"] == 300.0)
+    check("hours and seconds suffixes",
+          pysh("run", "--timeout", "1h", "w", "1")["wait"] == 3600.0 and
+          pysh("run", "--timeout", "90s", "w", "1")["wait"] == 90.0)
+    code_flag = pysh("run", "work", "print('--timeout 9')")
+    check("option text inside code untouched",
+          code_flag["args"] == ["work", "print('--timeout 9')"] and code_flag["wait"] is None, code_flag)
+    late = pysh("run", "work", "x", "--timeout", "9")
+    check("after code starts it is code", late["args"] == ["work", "x", "--timeout", "9"] and
+          late["wait"] is None, late)
+    check("env default", pysh("run", "work", "1", env={"PYTHOND_TIMEOUT": "2m"})["wait"] == 120.0)
+    check("flag beats env", pysh("run", "--timeout", "5", "work", "1",
+                                 env={"PYTHOND_TIMEOUT": "2m"})["wait"] == 5.0)
+    check("no flag, no env -> daemon default", pysh("run", "work", "1")["wait"] is None)
+    for bad in ("0", "-5", "1.5", "soon", "5d"):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                pysh("run", "--timeout", bad, "work", "1")
+                ok = False
+            except SystemExit as e:
+                ok = e.code == 2
+        check(f"rejects --timeout {bad}", ok and "positive duration" in err.getvalue(), err.getvalue())
+
+
+def test_integration_run_wait():
+    section("INTEGRATION: run honours Prefer: wait")
+    with tempfile.TemporaryDirectory() as td, _Daemon(td):
+        pythond._request("POST", "/new/slow")
+        status, headers, body = pythond._request(
+            "POST", "/run/slow", "import time; time.sleep(2); 'done'", wait=6)
+        check("longer wait lets a 2s cell finish", status == 200 and body == "done", (status, body))
+        check("Preference-Applied echoed", headers.get("Preference-Applied") == "wait=6", headers)
+        status, headers, body = pythond._request("POST", "/run/slow", "x = 1")
+        check("default run carries no Preference-Applied",
+              status == 200 and "Preference-Applied" not in headers, headers)
+        status, _h, body = pythond._request(
+            "POST", "/run/slow", "time.sleep(3)", wait=1)
+        check("short wait still times out with a hint",
+              status == 409 and "timeout after 1s" in body and "--timeout" in body, (status, body))
+
+
 # ===========================================
 
 def main():
@@ -2246,6 +2315,8 @@ def main():
         test_format_int,
         test_entry_points_exist,
         test_pysh_cli_smoke,
+        test_prefer_wait_parsing,
+        test_cli_run_timeout_parsing,
 
         # Integration tests
         test_kill_all_snapshot,
@@ -2264,6 +2335,7 @@ def main():
         test_integration_second_daemon_fails,
         test_integration_pickle_cp,
         test_integration_fork,
+        test_integration_run_wait,
     ]
     registered = {fn.__name__ for fn in tests}
     discovered = {name for name, obj in globals().items()

@@ -197,10 +197,22 @@ right away while a cell is running; the code in a refused request is discarded
 and the session stays healthy. `status`, `poll` and `int` work during a running
 cell (`status` reports `vars: null` while the namespace is in use). One command
 is in flight per worker at a time; a second command arriving meanwhile also
-gets `409 busy`. `run` waits 30 seconds for the reply; a cell that runs
-longer keeps running, but the reply timeout (like a malformed or oversized
-reply) leaves the channel out of sync, and the way on is `kill` then `new`.
-Longer work goes through `fire`.
+gets `409 busy`. `run` waits 30 seconds for the reply unless the client asks
+for longer with `Prefer: wait=N` ([RFC 7240](https://www.rfc-editor.org/rfc/rfc7240#section-4.3);
+the reply then carries `Preference-Applied: wait=N`, capped by
+`PYTHOND_MAX_WAIT`, default 3600). From the CLI:
+
+```bash
+pysh run --timeout 5m work @build.py     # or: pysh run work --timeout=300 "..."
+PYTHOND_TIMEOUT=2m pysh run work "..."   # default for this shell
+```
+
+`--timeout` takes seconds or `90s` / `5m` / `1h` and may sit before or after the
+name, ahead of the code. Wrapping the client in an outer `timeout` does not
+help: it kills the client, not the wait. A cell that outlives its wait keeps
+running, but the reply timeout (like a malformed or oversized reply) leaves the
+channel out of sync, and the way on is `kill` then `new`. Work of unknown
+length goes through `fire`.
 
 ### Completion events
 
