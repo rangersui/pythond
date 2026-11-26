@@ -139,6 +139,8 @@ _EVENT_OUTPUT_BYTES = 64 * 1024
 _EVENT_HEARTBEAT = 15.0
 _SESSION_READY_TIMEOUT = 10.0
 _SEND_TIMEOUT = 30.0
+# Upper bound for a client's `Prefer: wait=N` on run (RFC 7240 section 4.3).
+_MAX_RUN_WAIT = max(1.0, float(os.environ.get("PYTHOND_MAX_WAIT", "3600")))
 _CELL_SEQ = itertools.count()
 _INTERRUPT_LOCK = threading.Lock()
 _WORKER_ENV = "PYTHOND_INTERNAL_WORKER"
@@ -1248,8 +1250,9 @@ def _send_session_locked(name: str, s: JsonDict, cmd: str, args: list[str],
         line = s["q"].get(timeout=timeout)
     except queue.Empty:
         s["unhealthy"] = True
-        return {"error": "timeout -- command channel may be out of sync; "
-                         f"use kill {name} if stuck (accepted code may still run)"}
+        return {"error": f"timeout after {timeout:g}s -- command channel may be out of sync; "
+                         f"use kill {name} if stuck (accepted code may still run); "
+                         f"give long cells more time: pysh run --timeout 5m {name} ..."}
     if line is None:
         return {"error": f"session '{name}' dead -- new {name} to restart"}
     if len(line) > _MAX_WORKER_RESPONSE:
@@ -1334,9 +1337,26 @@ def _session_error_status(msg: str) -> int:
     return 409
 
 
+def _prefer_wait(values: list[str]) -> float | None:
+    """The client's `wait` preference in seconds (RFC 7240 section 4.3).
+
+    Prefer may repeat and carry several comma-separated preferences; unknown
+    or malformed ones are ignored, as the RFC asks of a server."""
+    for value in values:
+        for pref in value.split(","):
+            key, _, raw = pref.strip().partition("=")
+            if key.strip().lower() != "wait":
+                continue
+            raw = raw.strip().strip('"')
+            if raw.isdigit() and int(raw) > 0:
+                return min(float(raw), _MAX_RUN_WAIT)
+    return None
+
+
 def _daemon_command(method: str, cmd: str, name: str, var: str,
                     query: dict[str, list[str]],
-                    body_bytes: bytes) -> tuple[int, dict[str, str], str | bytes]:
+                    body_bytes: bytes,
+                    wait: float | None = None) -> tuple[int, dict[str, str], str | bytes]:
     """Execute one HTTP command.  Returns (status, extra_headers, body)."""
     headers: dict[str, str] = {}
 
@@ -1426,7 +1446,11 @@ def _daemon_command(method: str, cmd: str, name: str, var: str,
         cell = query.get("cell", [""])[0]
         if cell:
             args = [cell]
-    resp = send_session(name, cmd, args)
+    if cmd == "run" and wait is not None:
+        resp = send_session(name, cmd, args, timeout=wait)
+        headers["Preference-Applied"] = f"wait={int(wait)}"
+    else:
+        resp = send_session(name, cmd, args)
     bind_identity(resp)
 
     if "error" in resp and "_error" not in resp:
@@ -1571,8 +1595,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length)
         try:
-            status, extra, text = _daemon_command(method, cmd, name, var,
-                                                  query, body)
+            status, extra, text = _daemon_command(
+                method, cmd, name, var, query, body,
+                wait=_prefer_wait(self.headers.get_all("Prefer") or []))
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._reply(500, "ERR internal error", {"Connection": "close"})
@@ -1686,7 +1711,7 @@ def daemon(show_token: bool = False) -> None:
 # =============================================
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, path: str, timeout: float = 35) -> None:
+    def __init__(self, path: str, timeout: float = _SEND_TIMEOUT + 5) -> None:
         super().__init__("pythond", timeout=timeout)
         self._unix_path = path
 
@@ -1711,7 +1736,7 @@ def _parse_host_port(value: str, default_port: int = 7984) -> tuple[str, int]:
     return host, port
 
 
-def _connect() -> tuple[http.client.HTTPConnection, str | None]:
+def _connect(timeout: float = _SEND_TIMEOUT + 5) -> tuple[http.client.HTTPConnection, str | None]:
     """Connection + token for the configured daemon.
 
     PYTHOND_HOST targets a tunneled daemon (e.g. ssh -L); plain HTTP, so keep
@@ -1722,20 +1747,26 @@ def _connect() -> tuple[http.client.HTTPConnection, str | None]:
     token = os.environ.get("PYTHOND_TOKEN")
     if host:
         h, port = _parse_host_port(host)
-        return http.client.HTTPConnection(h, port, timeout=35), token
+        return http.client.HTTPConnection(h, port, timeout=timeout), token
     if _HAS_AF_UNIX:
-        return _UnixHTTPConnection(_sock_path()), None
+        return _UnixHTTPConnection(_sock_path(), timeout=timeout), None
     meta = _read_meta()
     port = int(os.environ.get("PYTHOND_PORT") or meta.get("port") or "7984")
-    return (http.client.HTTPConnection("127.0.0.1", port, timeout=35),
+    return (http.client.HTTPConnection("127.0.0.1", port, timeout=timeout),
             token or meta.get("token"))
 
 
 def _request_bytes(method: str, path: str,
-                   body: bytes | None = None) -> tuple[int, dict[str, str], bytes]:
-    """One HTTP request to the daemon.  Raises OSError-family on no daemon."""
-    conn, token = _connect()
+                   body: bytes | None = None,
+                   wait: float | None = None) -> tuple[int, dict[str, str], bytes]:
+    """One HTTP request to the daemon.  Raises OSError-family on no daemon.
+
+    wait asks the daemon to wait that long for a run (Prefer: wait=N); the
+    socket timeout follows it so the client never hangs up first."""
+    conn, token = _connect(_SEND_TIMEOUT + 5 if wait is None else wait + 5)
     headers = {}
+    if wait is not None:
+        headers["Prefer"] = f"wait={int(wait)}"
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
@@ -1748,10 +1779,11 @@ def _request_bytes(method: str, path: str,
 
 
 def _request(method: str, path: str,
-             body: str | None = None) -> tuple[int, dict[str, str], str]:
+             body: str | None = None,
+             wait: float | None = None) -> tuple[int, dict[str, str], str]:
     """_request_bytes for text commands."""
     status, headers, raw = _request_bytes(
-        method, path, body.encode("utf-8") if body is not None else None)
+        method, path, body.encode("utf-8") if body is not None else None, wait)
     return status, headers, raw.decode("utf-8", "replace")
 
 
@@ -1759,7 +1791,8 @@ def _quote(name: str) -> str:
     return urllib.parse.quote(name, safe="")
 
 
-def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
+def client(cmd: str, args: list[str], fail_on_err: bool = True,
+           wait: float | None = None) -> None:
     """CLI client.  Exit 1 on any ERR (daemon error or exec error)."""
     try:
         if cmd == "ls":
@@ -1791,7 +1824,11 @@ def client(cmd: str, args: list[str], fail_on_err: bool = True) -> None:
                 except OSError:
                     print(f"ERR cannot read file: {code[1:]}", file=sys.stderr)
                     sys.exit(1)
-            status, hdrs, text = _request("POST", f"/{cmd}/{_quote(name)}", code)
+            if cmd == "run" and wait is not None:
+                status, hdrs, text = _request("POST", f"/{cmd}/{_quote(name)}",
+                                              code, wait)
+            else:
+                status, hdrs, text = _request("POST", f"/{cmd}/{_quote(name)}", code)
             if (cmd == "run" and status == 200
                     and hdrs.get("X-Pythond-Exec-Error") == "1"):
                 print(f"ERR execution failed\n{text}", file=sys.stderr)
@@ -2014,6 +2051,13 @@ def _add_session_subparsers(sub: argparse._SubParsersAction) -> None:
         p_cmd = sub.add_parser(cname, help=chelp,
                                description="Code inline, or @file to post a "
                                            "local file's contents as the cell.")
+        if cname == "run":
+            p_cmd.epilog = (f"--timeout N[s|m|h] (or $PYTHOND_TIMEOUT) waits that long "
+                            f"for the reply instead of {_SEND_TIMEOUT:g}s; it may sit "
+                            "before or after the name, ahead of the code.")
+            # Parsed by _split_run_timeout from the raw argv; declared so
+            # argparse accepts it ahead of the name.
+            p_cmd.add_argument("--timeout", help=argparse.SUPPRESS)
         p_cmd.add_argument("name")
         p_cmd.add_argument("code", nargs=argparse.REMAINDER,
                            metavar="code|@file")
@@ -2056,7 +2100,56 @@ def _run_session_command(args: argparse.Namespace, argv: list[str]) -> None:
     if args.command == "kill":
         client("kill-all", []) if args.all_sessions else client("kill", [args.name])
         return
+    if args.command == "run":
+        try:
+            wait, rest = _split_run_timeout(argv[1:])
+            if wait is None and os.environ.get("PYTHOND_TIMEOUT"):
+                wait = _parse_seconds(os.environ["PYTHOND_TIMEOUT"])
+        except ValueError as e:
+            print(f"ERR {e}", file=sys.stderr)
+            sys.exit(2)
+        client("run", rest, wait=wait)
+        return
     client(args.command, argv[1:])
+
+
+_DURATION_RE = re.compile(r"^([1-9][0-9]*)([smh]?)$")
+
+
+def _parse_seconds(value: str) -> float:
+    """Whole seconds, or coreutils-style 90s / 5m / 1h."""
+    m = _DURATION_RE.match(value.strip())
+    if not m:
+        raise ValueError(f"timeout must be a positive duration like 300, 90s, 5m: {value!r}")
+    return float(int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)])
+
+
+def _split_run_timeout(tokens: list[str]) -> tuple[float | None, list[str]]:
+    """Pull --timeout out of `run`'s arguments.
+
+    Agents write it before or after the session name; everything from the
+    first argument after the name that is not the option is code, so a `--`
+    inside the code is never taken for an option."""
+    wait: float | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if len(rest) < 2 and (tok == "--timeout" or tok.startswith("--timeout=")):
+            if tok == "--timeout":
+                if i + 1 >= len(tokens):
+                    raise ValueError("--timeout needs a value")
+                value, i = tokens[i + 1], i + 2
+            else:
+                value, i = tok.split("=", 1)[1], i + 1
+            wait = _parse_seconds(value)
+            continue
+        rest.append(tok)
+        i += 1
+        if len(rest) >= 2:
+            rest.extend(tokens[i:])
+            break
+    return wait, rest
 
 
 def main() -> None:
