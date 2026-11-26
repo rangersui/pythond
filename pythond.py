@@ -1616,12 +1616,16 @@ class _TcpHTTPServer(ThreadingHTTPServer):
     # port and split traffic between two token sets.  Fail loud instead.
     allow_reuse_address = False
     daemon_threads = True
+    # socketserver listens with a backlog of 5; a burst of concurrent pysh
+    # calls overflows it, and macOS refuses (ECONNREFUSED) instead of queueing.
+    request_queue_size = 128
 
 
 if _HAS_AF_UNIX:
     class _UnixHTTPServer(ThreadingHTTPServer):
         address_family = socket.AF_UNIX  # type: ignore[attr-defined]
         daemon_threads = True
+        request_queue_size = 128
 
         def server_bind(self) -> None:
             # HTTPServer.server_bind assumes an (addr, port) tuple; skip it.
